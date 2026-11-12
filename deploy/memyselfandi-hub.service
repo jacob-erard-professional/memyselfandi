@@ -1,0 +1,17 @@
+# systemd --user unit for the hub. Install:
+#   cp deploy/memyselfandi-hub.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now memyselfandi-hub
+#   loginctl enable-linger $USER   # keep it running when you're logged out
+[Unit]
+Description=memyselfandi agent hub
+After=network-online.target tailscaled.service
+
+[Service]
+WorkingDirectory=%h/projects/memyselfandi
+# Bind to all interfaces; the token (from `mmi config --new-hub-token`) gates access.
+# To restrict to the tailnet, use --host <your tailscale IP> instead.
+ExecStart=%h/.local/bin/uv run mmi serve --host 0.0.0.0
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

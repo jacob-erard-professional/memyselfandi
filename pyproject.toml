@@ -1,0 +1,24 @@
+[project]
+name = "memyselfandi"
+version = "0.1.0"
+description = "A shared hub so your agents on every machine can see each other, split tasks, and message each other"
+readme = "README.md"
+authors = [
+    { name = "Jacob Erard", email = "erardjacob@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]>=1.20",
+]
+
+[project.scripts]
+mmi = "memyselfandi.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.15,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
