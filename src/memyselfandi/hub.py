@@ -399,7 +399,8 @@ def start_retention(store: Store, retention_days: float) -> None:
 
 
 def serve(host: str, port: int, db: Path, token: str | None, supervise: bool = True,
-          tiers: dict[str, str] | None = None, retention_days: float | None = None) -> None:
+          tiers: dict[str, str] | None = None, retention_days: float | None = None,
+          unix_socket: str | None = None) -> None:
     import logging
     import shutil
 
@@ -422,4 +423,18 @@ def serve(host: str, port: int, db: Path, token: str | None, supervise: bool = T
             Supervisor(store, f"http://{local_host}:{port}", token, DATA_DIR / "run").start()
             print("supervisor: organizers and council run in tmux session 'mmi' (`mmi attach`)")
     print(f"memyselfandi hub on http://{host}:{port}/mcp  (db: {db})")
-    uvicorn.run(build_app(store, host, token), host=host, port=port, log_level="warning")
+    import socket
+
+    sockets = [socket.create_server((host, port))]
+    if unix_socket:
+        # Also listen on a Unix socket, so a container can reach the hub through a mounted file instead of
+        # the network (see deploy/collab). Only processes that can open the file can connect.
+        path = Path(unix_socket)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.unlink(missing_ok=True)
+        uds = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        uds.bind(str(path))
+        path.chmod(0o660)
+        sockets.append(uds)
+        print(f"also listening on unix socket {path}")
+    uvicorn.Server(uvicorn.Config(build_app(store, host, token), log_level="warning")).run(sockets=sockets)

@@ -142,7 +142,7 @@ def cmd_serve(args, cfg):
 
     token = os.environ.get("MMI_TOKEN") or cfg.get("hub_token")
     serve(args.host, args.port or cfg.get("port") or DEFAULT_PORT, Path(args.db or DEFAULT_DB), token, supervise=not args.no_supervise,
-          tiers=cfg.get("tiers"), retention_days=cfg.get("retention_days"))
+          tiers=cfg.get("tiers"), retention_days=cfg.get("retention_days"), unix_socket=cfg.get("socket"))
 
 
 def cmd_up(args, cfg):
@@ -176,7 +176,7 @@ def cmd_config(args, cfg):
     stored = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
     if args.new_hub_token:
         stored["hub_token"] = stored["token"] = secrets.token_urlsafe(24)
-    for key in ("url", "token", "machine", "public_url", "port"):
+    for key in ("url", "token", "machine", "public_url", "port", "socket"):
         if getattr(args, key) is not None:
             stored[key] = getattr(args, key)
     if stored != (json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}):
@@ -466,6 +466,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--machine")
     s.add_argument("--public-url", help="hub URL invitees use (e.g. the shared node's tailnet address)")
     s.add_argument("--port", type=int, help="port this profile's hub listens on")
+    s.add_argument("--socket", help="also listen on this unix socket (the collab sidecar connects through it)")
     s.add_argument("--new-hub-token", action="store_true", help="generate a token for the hub you serve here")
     s.add_argument("--show-token", action="store_true")
     s.set_defaults(fn=cmd_config)

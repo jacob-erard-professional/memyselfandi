@@ -113,12 +113,18 @@ Collaborators get a **separate hub**: its own database, projects and organizer. 
 the shared node only forwards one port to the collab hub, which listens on `127.0.0.1` only.
 
 ```
-their tailnet ──share──► mmi-collab (Tailscale container) ──► collab hub on 127.0.0.1:7378 (profile "collab")
+their tailnet ──share──► mmi-collab (Tailscale container, isolated network) ──socat──► unix socket ──► collab hub
 ```
+
+The sidecar has its own network namespace and reaches the hub only through a mounted Unix socket file.
+Don't switch it to host networking. Tailscale's userspace mode forwards unserved ports to localhost, so with
+host networking every localhost-only service on the PC would be reachable by invitees. This was verified,
+then fixed.
 
 **One-time setup (hub PC):**
 ```bash
-uv run mmi --profile collab config --new-hub-token --url http://127.0.0.1:7378 --port 7378
+uv run mmi --profile collab config --new-hub-token --url http://127.0.0.1:7378 --port 7378 \
+    --socket ~/.local/share/memyselfandi/collab/sock/hub.sock
 uv run mmi --profile collab up --host 127.0.0.1                 # tmux session "mmi-collab"
 cd deploy/collab && cp .env.example .env                        # paste a Tailscale auth key into .env
 docker compose up -d                                            # "mmi-collab" appears in your tailnet

@@ -1,11 +1,13 @@
 # The node you share with collaborators (Tailscale device sharing).
-# It's its own device in your tailnet, so sharing it never exposes your PC: invitees can reach only
-# this container, and it only forwards TCP 7377 to the collab hub, which listens on 127.0.0.1:7378
-# (localhost only: not on your LAN or your main tailnet).
 #
-# Host networking is deliberate: ufw blocks Docker bridge networks from reaching the host, and this way
-# the hub never has to listen anywhere but localhost. Tailscale runs in userspace mode (no tun device,
-# no interference with the host's own tailscaled), on a random UDP port.
+# It's its own device in your tailnet, so sharing it never exposes your PC. It has its OWN network namespace
+# (a normal Docker bridge), so "localhost" inside it is the container's, not your PC's. That matters because
+# Tailscale in userspace mode forwards any unserved port to localhost: with host networking, that leaked
+# every localhost-only service on the PC (verified, then fixed).
+#
+# Path in:  tailnet :7377 -> tailscale serve -> 127.0.0.1:7378 (this namespace) -> socat
+#           -> unix socket file mounted from the host -> collab hub
+# Nothing on your PC's network is reachable from here; the socket file is the only way through.
 #
 #   cp .env.example .env    # put a Tailscale auth key in it (admin console > Settings > Keys)
 #   docker compose up -d
@@ -13,15 +15,23 @@
 services:
   mmi-collab:
     image: tailscale/tailscale:stable
-    network_mode: host
+    hostname: mmi-collab
     environment:
       TS_AUTHKEY: ${TS_AUTHKEY:?put a Tailscale auth key in .env}
       TS_HOSTNAME: mmi-collab
       TS_STATE_DIR: /var/lib/tailscale
       TS_USERSPACE: "true"
       TS_SERVE_CONFIG: /config/serve.json
-      TS_TAILSCALED_EXTRA_ARGS: --port=0
     volumes:
       - ./state:/var/lib/tailscale
       - ./serve.json:/config/serve.json:ro
+    restart: unless-stopped
+
+  relay:
+    image: alpine/socat:1.8.0.3
+    network_mode: service:mmi-collab   # shares mmi-collab's (isolated) network namespace
+    command: TCP-LISTEN:7378,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/run/mmi/hub.sock
+    volumes:
+      - ${MMI_SOCKET_DIR:-${HOME}/.local/share/memyselfandi/collab/sock}:/run/mmi
+    depends_on: [mmi-collab]
     restart: unless-stopped

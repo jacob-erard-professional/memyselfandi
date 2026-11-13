@@ -20,3 +20,6 @@
   `SCHEMA` (that's v1) or a released migration. Add a test that opens an older database.
 - Tickets are closed (`closed_at`), never deleted, except by the retention purge or `delete_project`.
 - Mind disk writes: never write to SQLite on a polling or tick path unless state changed (throttle heartbeats).
+- deploy/collab: the sidecar must keep its own network namespace (bridge). Tailscale userspace mode forwards
+  unserved ports to the namespace's localhost; with `network_mode: host` that exposed the PC's localhost services.
+  The hub is reached via the unix socket (`config --socket`) + socat relay.
