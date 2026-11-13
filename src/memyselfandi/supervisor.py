@@ -34,6 +34,7 @@ STARTUP_GRACE_S = 20        # let a fresh session boot before typing into it
 NUDGE_EVERY_S = 30          # don't re-nudge an idle organizer more often than this
 STALE_HOLD_S = 15 * 60      # organizer has held a ticket this long -> remind it
 COUNCIL_MAX_S = 90 * 60     # council members are dismissed after this long
+HEARTBEAT_EVERY_S = 120    # throttle organizer heartbeats: each one is a disk write
 COUNCIL_LINGER_S = 30       # keep a finished council window around briefly so you can glance at it
 
 SESSION_TOOLS = "mcp__memyselfandi,Read,Grep,Glob"
@@ -110,6 +111,8 @@ class Supervisor:
         self.launched_at: dict[str, float] = {}
         self.last_nudge: dict[str, float] = {}
         self.trust_flagged: set[str] = set()
+        self.last_heartbeat: dict[str, float] = {}
+        self.windows: dict[str, str] = {}  # agent id -> project, for every window we launched
         self._stop = threading.Event()
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.mcp_config = self._write_mcp_config()
@@ -152,7 +155,12 @@ class Supervisor:
         click it; we flag the agent and notify instead."""
         win = window_name(agent_id)
         if "trust this folder" not in self.runner.capture(win):
-            self.trust_flagged.discard(agent_id)
+            if agent_id in self.trust_flagged:  # user answered it; clear the BLOCKED status
+                self.trust_flagged.discard(agent_id)
+                try:
+                    self.store.heartbeat(agent_id, status="ready")
+                except LookupError:
+                    pass
             return False
         if agent_id not in self.trust_flagged:
             self.trust_flagged.add(agent_id)
@@ -160,10 +168,10 @@ class Supervisor:
                    f"prompt. Run `mmi attach {win}` and answer it (one time per repo).")
             log.warning(msg)
             self._notify(msg)
-        try:
-            self.store.heartbeat(agent_id, status="BLOCKED: waiting for you to accept the folder-trust prompt")
-        except LookupError:
-            pass
+            try:
+                self.store.heartbeat(agent_id, status="BLOCKED: waiting for you to accept the folder-trust prompt")
+            except LookupError:
+                pass
         return True
 
     # -- organizers ----------------------------------------------------------
@@ -181,16 +189,19 @@ class Supervisor:
                  "until it's empty, then wait.")
         argv = self._argv(agent_id, ORGANIZER_MODEL, system, first, f"organizer:{project['name']}")
         self.runner.launch(window_name(agent_id), project["path"], argv)
+        self.windows[agent_id] = project["name"]
         self.launched_at[agent_id] = self.last_nudge[agent_id] = now
         log.info("launched organizer %s", agent_id)
 
     def _tend_organizer(self, project: dict, n: int, now: float) -> None:
         agent_id = f"org-{project['name']}-{n}"
-        try:
-            self.store.heartbeat(agent_id, status="organizer")
-        except LookupError:
-            self.store.register(f"organizer #{n}", "hub", "organizer", project=project["name"],
-                                status="organizer", agent_id=agent_id)
+        if now - self.last_heartbeat.get(agent_id, 0) >= HEARTBEAT_EVERY_S:
+            try:
+                self.store.heartbeat(agent_id)
+            except LookupError:
+                self.store.register(f"organizer #{n}", "hub", "organizer", project=project["name"],
+                                    status="organizer", agent_id=agent_id)
+            self.last_heartbeat[agent_id] = now
         win = window_name(agent_id)
         if not self.runner.has_window(win):
             self._launch_organizer(project, agent_id, now)
@@ -230,6 +241,7 @@ class Supervisor:
         first = f"You're council member {c['id']}. Do your brief now and finish with council_report."
         argv = self._argv(c["id"], c["model"], system, first, f"council:{c['role']}")
         self.runner.launch(window_name(c["id"]), project["path"], argv)
+        self.windows[c["id"]] = c["project"]
         self.store.set_council_status(c["id"], "running")
         if c["tier"] == "elder":
             self._notify(f"memyselfandi: elder ({c['model']}) summoned on {c['project']} as '{c['role']}'. "
@@ -238,6 +250,7 @@ class Supervisor:
 
     def _fail_council(self, c: dict, why: str) -> None:
         self.store.set_council_status(c["id"], "failed")
+        self.windows.pop(c["id"], None)
         if c["ticket_id"]:
             t = self.store.get_ticket(c["ticket_id"])
             if t["status"] == "delegated" and t["handler"] == c["id"]:
@@ -259,15 +272,26 @@ class Supervisor:
                 self._fail_council(c, f"ran past {COUNCIL_MAX_S // 60} minutes and was dismissed")
         # Dismiss members that reported.
         for c in self.store.list_council(active_only=False):
-            if c["status"] == "done" and now - (c["finished_at"] or now) > COUNCIL_LINGER_S:
+            if c["status"] == "done" and c["id"] in self.windows and now - (c["finished_at"] or now) > COUNCIL_LINGER_S:
                 win = window_name(c["id"])
-                if self.runner.has_window(win):
-                    self.runner.kill(win)
+                self.runner.kill(win)
+                self.windows.pop(c["id"], None)
 
     # -- loop --------------------------------------------------------------
+    def _reap_deleted(self, live_projects: set[str]) -> None:
+        """Close windows whose project was deleted (`mmi project delete`)."""
+        for agent_id, project in list(self.windows.items()):
+            if project not in live_projects:
+                self.runner.kill(window_name(agent_id))
+                del self.windows[agent_id]
+                for d in (self.launched_at, self.last_nudge, self.last_heartbeat):
+                    d.pop(agent_id, None)
+
     def tick(self, now: float | None = None) -> None:
         now = now or time.time()
-        for project in self.store.list_projects():
+        projects = self.store.list_projects()
+        self._reap_deleted({p["name"] for p in projects})
+        for project in projects:
             for n in range(1, project["organizers"] + 1):
                 self._tend_organizer(project, n, now)
         self._tend_council(now)

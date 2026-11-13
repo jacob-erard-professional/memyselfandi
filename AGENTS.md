@@ -13,3 +13,7 @@
   positional and first, because `--allowedTools`/`--mcp-config` are variadic.
 - Never auto-answer Claude Code's folder-trust prompt. The supervisor flags it and notifies the user.
 - The hub runs on the user's always-on desktop, reached over Tailscale with a bearer token. No public endpoints.
+- Schema changes: append a migration to `MIGRATIONS` in `store.py` (version, description, SQL statements). Never edit
+  `SCHEMA` (that's v1) or a released migration. Add a test that opens an older database.
+- Tickets are closed (`closed_at`), never deleted, except by the retention purge or `delete_project`.
+- Mind disk writes: never write to SQLite on a polling or tick path unless state changed (throttle heartbeats).

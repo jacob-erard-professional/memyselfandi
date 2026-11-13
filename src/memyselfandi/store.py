@@ -131,6 +131,24 @@ CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient);
 """
 
 
+# Schema migrations, applied in order and tracked in PRAGMA user_version. SCHEMA above is version 1
+# (idempotent, so databases created before migrations existed adopt it cleanly). Never edit a
+# released migration; append a new one.
+MIGRATIONS: list[tuple[int, str, list[str]]] = [
+    (2, "tickets are closed, never deleted: add closed_at; index tickets by project", [
+        "ALTER TABLE tickets ADD COLUMN closed_at REAL",
+        "UPDATE tickets SET closed_at = COALESCE(answered_at, picked_at, created_at) "
+        "WHERE status IN ('answered', 'cancelled')",
+        "CREATE INDEX IF NOT EXISTS idx_tickets_closed ON tickets(closed_at)",
+        "CREATE INDEX IF NOT EXISTS idx_tickets_project ON tickets(project)",
+    ]),
+]
+SCHEMA_VERSION = max([1, *(v for v, _, _ in MIGRATIONS)])
+
+# Closed tickets older than this are purged (hub config "retention_days" overrides).
+DEFAULT_RETENTION_DAYS = 365
+
+
 def _short_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
@@ -158,7 +176,34 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
-        self._db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        with self._lock:
+            version = self._db.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise RuntimeError(f"database is schema v{version}, newer than this code (v{SCHEMA_VERSION}); upgrade")
+            if version < 1:
+                self._db.executescript(SCHEMA)
+                self._db.execute("PRAGMA user_version = 1")
+                version = 1
+            for v, _desc, statements in MIGRATIONS:
+                if v <= version:
+                    continue
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    for stmt in statements:
+                        self._db.execute(stmt)
+                    self._db.execute(f"PRAGMA user_version = {v}")
+                    self._db.execute("COMMIT")
+                except Exception:
+                    self._db.execute("ROLLBACK")
+                    raise
+                version = v
+
+    @property
+    def schema_version(self) -> int:
+        return self._q("PRAGMA user_version")[0]["user_version"]
 
     # -- helpers -----------------------------------------------------------
     def _q(self, sql: str, args: tuple = ()) -> list[dict[str, Any]]:
@@ -392,6 +437,51 @@ class Store:
             )[0]["n"]
         return projects
 
+    def project_rows(self, name: str) -> dict[str, int]:
+        """How many rows each table holds for a project (what delete_project would remove)."""
+        q = lambda sql: self._q(sql, (name,))[0]["n"]  # noqa: E731
+        return {
+            "tickets": q("SELECT COUNT(*) n FROM tickets WHERE project=?"),
+            "tasks": q("SELECT COUNT(*) n FROM tasks WHERE project=?"),
+            "task_notes": q("SELECT COUNT(*) n FROM task_notes WHERE task_id IN (SELECT id FROM tasks WHERE project=?)"),
+            "council": q("SELECT COUNT(*) n FROM council WHERE project=?"),
+            "ledger_log": q("SELECT COUNT(*) n FROM ledger_log WHERE project=?"),
+            "hub_agents": q("SELECT COUNT(*) n FROM agents WHERE project=? AND kind IN ('organizer','council')"),
+        }
+
+    def delete_project(self, name: str) -> dict[str, int]:
+        """Permanently delete a project and every row tagged with it, in one transaction. Workers that were
+        on the project keep their agent records (they're per-machine identities), minus the project tag."""
+        self.get_project(name)
+        counts = self.project_rows(name)
+        statements = [
+            "DELETE FROM task_notes WHERE task_id IN (SELECT id FROM tasks WHERE project=?)",
+            "DELETE FROM tasks WHERE project=?",
+            "DELETE FROM tickets WHERE project=?",
+            "DELETE FROM council WHERE project=?",
+            "DELETE FROM ledger_log WHERE project=?",
+            "DELETE FROM ledger WHERE project=?",
+            "DELETE FROM reads WHERE agent_id IN (SELECT id FROM agents WHERE project=? AND kind IN ('organizer','council'))",
+            "DELETE FROM agents WHERE project=? AND kind IN ('organizer','council')",
+            "UPDATE agents SET project=NULL WHERE project=?",
+            "DELETE FROM projects WHERE name=?",
+        ]
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                for stmt in statements:
+                    self._db.execute(stmt, (name,))
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+        return counts
+
+    def purge_closed_tickets(self, older_than_days: float = DEFAULT_RETENTION_DAYS) -> int:
+        """Delete tickets that were closed more than `older_than_days` ago. Open tickets are never purged."""
+        cutoff = time.time() - older_than_days * 86400
+        return self._x("DELETE FROM tickets WHERE closed_at IS NOT NULL AND closed_at < ?", (cutoff,)).rowcount
+
     # -- ledger ------------------------------------------------------------
     def get_ledger(self, project: str, log_limit: int = 30) -> dict[str, Any]:
         self.get_project(project)
@@ -455,6 +545,7 @@ class Store:
             raise NotFound(f"unknown ticket {ticket_id!r}")
         t = rows[0]
         t["blocking"] = bool(t["blocking"])
+        t["closed"] = t["closed_at"] is not None
         t["position"] = self._position(t)
         return t
 
@@ -464,7 +555,7 @@ class Store:
             sql += " AND project=?"
             args.append(project)
         if open_only:
-            sql += " AND status IN ('queued','with_organizer','delegated')"
+            sql += " AND closed_at IS NULL"
         sql += " ORDER BY lane, created_at"
         return [self.get_ticket(r["id"]) for r in self._q(sql, tuple(args))]
 
@@ -499,8 +590,8 @@ class Store:
         if t["status"] not in ("with_organizer", "delegated") or not (is_handler or is_project_organizer):
             raise Forbidden(f"{by} can't answer {ticket_id} (status {t['status']}, handler {t['handler']})")
         self._x(
-            "UPDATE tickets SET status='answered', reply=?, answered_by=?, answered_at=? WHERE id=?",
-            (reply, by, time.time(), ticket_id),
+            "UPDATE tickets SET status='answered', reply=?, answered_by=?, answered_at=?, closed_at=? WHERE id=?",
+            (reply, by, now := time.time(), now, ticket_id),
         )
         return self.get_ticket(ticket_id)
 
@@ -514,7 +605,8 @@ class Store:
         t = self.get_ticket(ticket_id)
         if t["asker"] != by:
             raise Forbidden("only the asker can cancel a ticket")
-        self._x("UPDATE tickets SET status='cancelled' WHERE id=? AND status!='answered'", (ticket_id,))
+        self._x("UPDATE tickets SET status='cancelled', closed_at=? WHERE id=? AND closed_at IS NULL",
+                (time.time(), ticket_id))
         return self.get_ticket(ticket_id)
 
     # -- council -----------------------------------------------------------

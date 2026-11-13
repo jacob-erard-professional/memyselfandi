@@ -328,6 +328,8 @@ def build_server(store: Store) -> MCPServer:
         ops = {
             "add_project": lambda: store.add_project(**args),
             "remove_agent": lambda: store.remove_agent(**args) or {"ok": True},
+            "project_rows": lambda: store.project_rows(**args),
+            "delete_project": lambda: store.delete_project(**args),
         }
         if request.path_params["op"] not in ops:
             return JSONResponse({"error": "no such op"}, status_code=404)
@@ -363,15 +365,38 @@ def build_app(store: Store, host: str, token: str | None):
     return TokenAuth(app, token) if token else app
 
 
+def start_retention(store: Store, retention_days: float) -> None:
+    """Purge closed tickets older than the retention window: at startup, then daily."""
+    import logging
+    import threading
+
+    log = logging.getLogger("memyselfandi.retention")
+
+    def loop():
+        while True:
+            try:
+                n = store.purge_closed_tickets(retention_days)
+                if n:
+                    log.info("purged %d tickets closed more than %s days ago", n, retention_days)
+            except Exception:
+                log.exception("retention purge failed")
+            threading.Event().wait(86400)
+
+    threading.Thread(target=loop, name="mmi-retention", daemon=True).start()
+
+
 def serve(host: str, port: int, db: Path, token: str | None, supervise: bool = True,
-          tiers: dict[str, str] | None = None) -> None:
+          tiers: dict[str, str] | None = None, retention_days: float | None = None) -> None:
     import logging
     import shutil
 
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    from .store import DEFAULT_RETENTION_DAYS
+
     store = Store(db, tiers=tiers)
+    start_retention(store, retention_days or DEFAULT_RETENTION_DAYS)
     if host not in ("127.0.0.1", "localhost", "::1") and not token:
         print("warning: listening beyond localhost without a token; anyone on that network can use the hub")
     if supervise:

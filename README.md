@@ -92,7 +92,24 @@ mmi queue myapp                # who's waiting in line
 mmi council myapp -a           # who's been summoned, at what tier
 mmi ask myapp -w "prioritize the auth bug over the UI work"   # you can queue tickets too
 mmi attach                     # watch the organizer/council sessions (tmux)
+mmi project delete myapp       # wipe a project and everything tagged with it
 ```
+
+## Storage
+
+Everything lives in one SQLite file on the hub: `~/.local/share/memyselfandi/hub.db` (or `MMI_DB`).
+Other machines only talk to it over HTTP; nothing is synced.
+
+- **Tickets are never deleted by agents.** Answering or cancelling one marks it closed (`closed_at`).
+- **Retention:** the hub purges tickets that were closed more than 365 days ago, at startup and then daily.
+  Change it with `"retention_days"` in the config. Open tickets are never purged.
+- **Per-project data:** every row belongs to a project via its `project` column. `mmi project delete <name>`
+  shows what it will remove and asks for confirmation. It then deletes that project's tickets, tasks, notes,
+  council, ledger, and organizer/council identities, and closes their tmux windows.
+- **Migrations:** the schema version lives in `PRAGMA user_version`. Migrations live in `store.py`
+  (`MIGRATIONS`) and run automatically when the hub opens the database.
+- **Disk writes:** writes happen only when something changes: a ticket, a task, the ledger, or a
+  heartbeat throttled to every 2 minutes. Waiting and polling only read.
 
 ## Development
 

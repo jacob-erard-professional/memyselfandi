@@ -129,7 +129,7 @@ def cmd_serve(args, cfg):
 
     token = os.environ.get("MMI_TOKEN") or cfg.get("hub_token")
     serve(args.host, args.port, Path(args.db or DEFAULT_DB), token, supervise=not args.no_supervise,
-          tiers=cfg.get("tiers"))
+          tiers=cfg.get("tiers"), retention_days=cfg.get("retention_days"))
 
 
 def cmd_up(args, cfg):
@@ -243,6 +243,17 @@ def cmd_project_add(args, cfg):
     print(f"first time only: Claude Code asks whether to trust {p['path']}. `mmi attach org-{p['name']}-1` and answer it")
 
 
+def cmd_project_delete(args, cfg):
+    rows = admin(cfg, "project_rows", name=args.name)
+    print(f"This permanently deletes project '{args.name}': " + ", ".join(f"{n} {k}" for k, n in rows.items())
+          + ", plus its ledger. Its organizer and council sessions will be closed.")
+    if not args.yes:
+        if not sys.stdin.isatty() or input(f"Type the project name to confirm: ").strip() != args.name:
+            sys.exit("mmi: not deleted")
+    admin(cfg, "delete_project", name=args.name)
+    print(f"deleted {args.name}")
+
+
 def cmd_projects(args, cfg):
     for p in call(cfg, "list_projects"):
         print(f"  {p['name']:<20} {p['queued']} queued   {p['path']}")
@@ -349,6 +360,10 @@ def main(argv: list[str] | None = None) -> None:
     pa.add_argument("--organizers", type=int, default=1)
     pa.set_defaults(fn=cmd_project_add)
     psub.add_parser("list").set_defaults(fn=cmd_projects)
+    pd = psub.add_parser("delete", help="permanently delete a project and every row tagged with it")
+    pd.add_argument("name")
+    pd.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    pd.set_defaults(fn=cmd_project_delete)
 
     s = sub.add_parser("queue", help="a project's organizer queue")
     s.add_argument("project")
