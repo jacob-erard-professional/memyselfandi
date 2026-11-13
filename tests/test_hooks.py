@@ -59,6 +59,7 @@ def test_install_adds_skill_and_removes_old_auto_hook(tmp_path, monkeypatch):
     assert d["permissions"]["allow"] == ["mcp__memyselfandi"]
     skill = (tmp_path / "skills" / "memyselfandi" / "SKILL.md").read_text()
     assert skill.startswith("---\nname: memyselfandi\n") and "-m memyselfandi.cli connect" in skill
+    assert skill == claude_hooks.render_skill() and "{command}" not in skill
     claude_hooks.uninstall()
     assert not (tmp_path / "skills" / "memyselfandi").exists()
     assert "mcp__memyselfandi" not in json.loads(settings.read_text())["permissions"]["allow"]

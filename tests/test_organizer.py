@@ -101,7 +101,7 @@ def test_supervisor_launches_wakes_and_manages_council(store, tmp_path):
     sup = Supervisor(store, "http://127.0.0.1:1", "tok", tmp_path, runner=r, claude_bin="claude")
     sup.tick(now=1000)
     argv = r.windows["org-app-1"]
-    assert argv[:2] == ["env", "MMI_ROLE=organizer"]  # so the SessionStart hook skips it
+    assert argv[:2] == ["env", "MMI_ROLE=organizer"]  # marks hub-launched sessions
     i = argv.index("claude")
     assert "claude-opus-5-5" in argv and "dontAsk" in argv
     assert "organizer_next" in argv[i + 1]  # positional prompt comes first
