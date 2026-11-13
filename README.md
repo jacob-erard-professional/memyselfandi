@@ -60,8 +60,7 @@ plate, and they hand work back out.
 cd ~/projects/memyselfandi && uv sync
 uv run mmi config --new-hub-token            # token in ~/.config/memyselfandi/config.json
 uv run mmi up                                # hub + supervisor in tmux session "mmi"
-uv run mmi project add myapp --path ~/projects/myapp -d "what this project is"
-uv run mmi attach org-myapp-1                # first time per repo: accept Claude Code's folder-trust prompt
+cd ~/projects/myapp && uv run --project ~/projects/memyselfandi mmi project add --trust -d "what it is"
 uv run mmi install-claude                    # this machine's Claude Code: MCP server + /memyselfandi skill
 ```
 
@@ -80,6 +79,17 @@ git clone <this repo> && cd memyselfandi && uv sync
 uv run mmi config --url http://jacob-erard-desktop:7377 --token <`mmi config --show-token` on the PC>
 uv run mmi install-claude                    # Claude Code (`mmi mcp-setup` prints the Codex config block)
 ```
+
+### New projects
+
+From inside any git repo, on any of your machines: `mmi project add`. It starts a new organizer for that repo.
+- **Defaults** come from the repo you're in: the name is the folder name, plus the repo root and its `origin` remote.
+- **On the hub PC** it uses the folder where it is.
+- **On another machine** the hub clones `origin` into `~/projects/<name>` on the PC, because organizers read code
+  there. Change the location with `"projects_root"` in the hub config.
+- **`--trust`** means you trust this repo, so the hub accepts Claude Code's folder-trust prompt for it. Without it,
+  the organizer waits until you `mmi attach org-<name>-1` and answer it yourself.
+- **From a session:** `/memyselfandi` offers to do this when the repo isn't registered yet. It asks you first.
 
 ### Connecting a session (opt-in)
 

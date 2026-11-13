@@ -250,12 +250,33 @@ def cmd_inbox(args, cfg):
     print(fmt_messages(call(cfg, "read_inbox", agent_id=me(cfg), include_read=args.all)))
 
 
+def _git(cwd: str, *args: str) -> str | None:
+    import subprocess
+
+    r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
 def cmd_project_add(args, cfg):
-    path = str(Path(args.path).expanduser().resolve())
-    p = admin(cfg, "add_project", name=args.name, path=path, description=args.description or "",
-              organizers=args.organizers)
-    print(f"project {p['name']} -> {p['path']} ({p['organizers']} organizer(s)); the hub will start its organizer")
-    print(f"first time only: Claude Code asks whether to trust {p['path']}. `mmi attach org-{p['name']}-1` and answer it")
+    """Defaults come from the git repo you're in: name = folder name, path = repo root (used if it exists on the
+    hub, i.e. you're on the hub machine), git = its origin remote (the hub clones it if the path isn't there)."""
+    root = _git(os.getcwd(), "rev-parse", "--show-toplevel")
+    path = str(Path(args.path).expanduser().resolve()) if args.path else root
+    git_url = args.git or (_git(root, "remote", "get-url", "origin") if root else None)
+    name = args.name or (Path(path).name if path else None)
+    if not name:
+        sys.exit("mmi: give a project name, or run this inside a git repo")
+    if not (path or git_url):
+        sys.exit("mmi: not in a git repo; pass --path (a folder on the hub) or --git <clone url>")
+    p = admin(cfg, "add_project", name=name, path=path, git_url=git_url, description=args.description or "",
+              organizers=args.organizers, trust=args.trust)
+    how = f"cloned from {p['source']}" if p["action"] == "cloned" else "existing folder"
+    print(f"project {p['name']} -> {p['path']} on the hub ({how}); starting {p['organizers']} organizer(s)")
+    if args.trust:
+        print("the hub will accept Claude Code's folder-trust prompt for this folder (you passed --trust)")
+    else:
+        print(f"first time only: Claude Code asks whether to trust {p['path']}. "
+              f"`mmi attach org-{p['name']}-1` on the hub and answer it (or re-add with --trust)")
 
 
 def cmd_project_delete(args, cfg):
@@ -415,9 +436,12 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("project", help="register a project (gives it an organizer)")
     psub = s.add_subparsers(dest="pcmd", required=True)
-    pa = psub.add_parser("add")
-    pa.add_argument("name")
-    pa.add_argument("--path", required=True, help="repo path on the hub machine")
+    pa = psub.add_parser("add", help="register a project and start its organizer (defaults from the repo you're in)")
+    pa.add_argument("name", nargs="?", help="default: the repo's folder name")
+    pa.add_argument("--path", help="folder on the hub machine (default: this repo, if it's on the hub)")
+    pa.add_argument("--git", help="clone URL; the hub clones it if the folder isn't on the hub (default: origin)")
+    pa.add_argument("--trust", action="store_true",
+                    help="you trust this repo: let the hub accept Claude Code's folder-trust prompt for it")
     pa.add_argument("-d", "--description")
     pa.add_argument("--organizers", type=int, default=1)
     pa.set_defaults(fn=cmd_project_add)

@@ -49,6 +49,7 @@ class Runner(Protocol):
     def send(self, name: str, text: str) -> None: ...
     def kill(self, name: str) -> None: ...
     def capture(self, name: str) -> str: ...
+    def press(self, name: str, *keys: str) -> None: ...
 
 
 class TmuxRunner:
@@ -84,6 +85,11 @@ class TmuxRunner:
     def capture(self, name: str) -> str:
         return self._tmux("capture-pane", "-p", "-t", f"={self.session}:{name}").stdout
 
+    def press(self, name: str, *keys: str) -> None:
+        for key in keys:
+            self._tmux("send-keys", "-t", f"={self.session}:{name}", key)
+            time.sleep(0.2)
+
 
 def window_name(agent_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "-", agent_id)
@@ -114,6 +120,7 @@ class Supervisor:
         self.launched_at: dict[str, float] = {}
         self.last_nudge: dict[str, float] = {}
         self.trust_flagged: set[str] = set()
+        self.trust_answered: dict[str, float] = {}
         self.last_heartbeat: dict[str, float] = {}
         self.windows: dict[str, str] = {}  # agent id -> project, for every window we launched
         self._stop = threading.Event()
@@ -157,10 +164,22 @@ class Supervisor:
             log.warning("notify failed: %s", e)
 
     def _stuck_on_trust(self, agent_id: str, project: str) -> bool:
-        """Claude Code asks once per folder whether to trust it. That's the user's call, so we don't
-        click it; we flag the agent and notify instead."""
+        """Claude Code asks once per folder whether to trust it. That's the user's call: we only answer it for
+        projects added with --trust (explicit consent for that folder); otherwise we flag the agent and notify."""
         win = window_name(agent_id)
-        if "trust this folder" not in self.runner.capture(win):
+        screen = self.runner.capture(win)
+        if "trust this folder" in screen:
+            try:
+                auto = bool(self.store.get_project(project).get("auto_trust"))
+            except LookupError:
+                auto = False
+            if auto:
+                if time.time() - self.trust_answered.get(agent_id, 0) > 10:
+                    self.runner.press(win, "Down", "Enter")  # "Yes, I trust this folder"
+                    self.trust_answered[agent_id] = time.time()
+                    log.info("accepted folder trust for %s (project %s added with --trust)", agent_id, project)
+                return True
+        if "trust this folder" not in screen:
             if agent_id in self.trust_flagged:  # user answered it; clear the BLOCKED status
                 self.trust_flagged.discard(agent_id)
                 try:

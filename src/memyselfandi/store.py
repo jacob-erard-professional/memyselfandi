@@ -153,6 +153,9 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
             revoked_at   REAL
         )""",
     ]),
+    (4, "projects can opt in to auto-accepting Claude Code's folder-trust prompt", [
+        "ALTER TABLE projects ADD COLUMN auto_trust INTEGER NOT NULL DEFAULT 0",
+    ]),
 ]
 SCHEMA_VERSION = max([1, *(v for v, _, _ in MIGRATIONS)])
 
@@ -423,13 +426,15 @@ class Store:
         return rows
 
     # -- projects ----------------------------------------------------------
-    def add_project(self, name: str, path: str, description: str = "", organizers: int = 1) -> dict[str, Any]:
+    def add_project(self, name: str, path: str, description: str = "", organizers: int = 1,
+                    auto_trust: bool = False) -> dict[str, Any]:
         now = time.time()
         self._x(
-            """INSERT INTO projects (name, path, description, organizers, created_at) VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO projects (name, path, description, organizers, auto_trust, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET path=excluded.path, description=excluded.description,
-                   organizers=excluded.organizers""",
-            (name, path, description, organizers, now),
+                   organizers=excluded.organizers, auto_trust=excluded.auto_trust""",
+            (name, path, description, organizers, int(auto_trust), now),
         )
         self._x("INSERT OR IGNORE INTO ledger (project, summary, updated_at) VALUES (?, '', ?)", (name, now))
         return self.get_project(name)

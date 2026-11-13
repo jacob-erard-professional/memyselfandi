@@ -16,6 +16,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from .projects import provision_project
 from .store import Conflict, Forbidden, NotFound, Store
 
 DATA_DIR = Path(os.environ.get("MMI_DATA", Path.home() / ".local/share/memyselfandi"))
@@ -49,7 +50,7 @@ Worker protocol:
 """
 
 
-def build_server(store: Store) -> MCPServer:
+def build_server(store: Store, projects_root: str | Path = Path.home() / "projects") -> MCPServer:
     mcp = MCPServer("memyselfandi", instructions=INSTRUCTIONS, version="0.2.0")
     tools: dict[str, Any] = {}
 
@@ -329,7 +330,7 @@ def build_server(store: Store) -> MCPServer:
     async def admin(request: Request) -> Response:
         args = await request.json() if await request.body() else {}
         ops = {
-            "add_project": lambda: store.add_project(**args),
+            "add_project": lambda: provision_project(store, projects_root=projects_root, **args),
             "remove_agent": lambda: store.remove_agent(**args) or {"ok": True},
             "project_rows": lambda: store.project_rows(**args),
             "delete_project": lambda: store.delete_project(**args),
@@ -340,7 +341,9 @@ def build_server(store: Store) -> MCPServer:
         if request.path_params["op"] not in ops:
             return JSONResponse({"error": "no such op"}, status_code=404)
         try:
-            return Response(json.dumps(ops[request.path_params["op"]](), default=str), media_type="application/json")
+            # off the event loop: add_project may git-clone, which can take a while
+            result = await asyncio.to_thread(ops[request.path_params["op"]])
+            return Response(json.dumps(result, default=str), media_type="application/json")
         except (NotFound, TypeError, ValueError) as e:
             return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -370,8 +373,8 @@ class TokenAuth:
         await self.app(scope, receive, send)
 
 
-def build_app(store: Store, host: str, token: str | None):
-    mcp = build_server(store)
+def build_app(store: Store, host: str, token: str | None, projects_root: str | Path = Path.home() / "projects"):
+    mcp = build_server(store, projects_root)
     local = host in ("127.0.0.1", "localhost", "::1")
     security = None if local else TransportSecuritySettings(enable_dns_rebinding_protection=False)
     app = mcp.streamable_http_app(host=host, transport_security=security)
@@ -400,7 +403,7 @@ def start_retention(store: Store, retention_days: float) -> None:
 
 def serve(host: str, port: int, db: Path, token: str | None, supervise: bool = True,
           tiers: dict[str, str] | None = None, retention_days: float | None = None,
-          unix_socket: str | None = None) -> None:
+          unix_socket: str | None = None, projects_root: str | None = None) -> None:
     import logging
     import shutil
 
@@ -437,4 +440,5 @@ def serve(host: str, port: int, db: Path, token: str | None, supervise: bool = T
         path.chmod(0o660)
         sockets.append(uds)
         print(f"also listening on unix socket {path}")
-    uvicorn.Server(uvicorn.Config(build_app(store, host, token), log_level="warning")).run(sockets=sockets)
+    app = build_app(store, host, token, projects_root or Path.home() / "projects")
+    uvicorn.Server(uvicorn.Config(app, log_level="warning")).run(sockets=sockets)

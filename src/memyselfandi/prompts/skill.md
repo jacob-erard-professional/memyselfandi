@@ -16,7 +16,18 @@ across machines and remembers where work left off.
    ```
 
    It prints your agent id, the project, and the protocol. If it says the directory isn't a registered
-   project, tell the user which projects exist and ask which one (or whether to skip).
+   project, tell the user which projects exist and ask whether to use one of them, or to **create a new
+   project for this repo** (it gets its own organizer). Only if they say to create one, ask whether they
+   trust this repo enough for the hub to accept Claude Code's folder-trust prompt for it, then run this from the
+   repo root, with `--trust` only if they said yes:
+
+   ```bash
+   {command} project add [--trust]
+   ```
+
+   It registers the repo, cloning it onto the hub machine if it only exists here, and starts the organizer.
+   Then run the connect command again. If it fails with a permission error, this machine has an invite token
+   that can't create projects; tell the user.
 3. Follow the printed protocol with the `{server}` MCP tools. Usually: check in, wait for the
    organizer's reply, and relay the briefing to the user.
 

@@ -79,6 +79,7 @@ class FakeRunner:
         self.windows: dict[str, list[str]] = {}
         self.sent: list[tuple[str, str]] = []
         self.screens: dict[str, str] = {}
+        self.pressed: list = []
 
     def has_window(self, name):
         return name in self.windows
@@ -94,6 +95,9 @@ class FakeRunner:
 
     def capture(self, name):
         return self.screens.get(name, "")
+
+    def press(self, name, *keys):
+        self.pressed.append((name, keys))
 
 
 def test_supervisor_launches_wakes_and_manages_council(store, tmp_path):
