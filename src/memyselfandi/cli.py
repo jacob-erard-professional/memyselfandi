@@ -52,7 +52,7 @@ def call(cfg: dict[str, Any], tool: str, _path: str | None = None, **args: Any) 
     if cfg.get("token"):
         req.add_header("Authorization", f"Bearer {cfg['token']}")
     try:
-        with urllib.request.urlopen(req, timeout=args.get("timeout_s", 0) + 15) as r:
+        with urllib.request.urlopen(req, timeout=cfg.get("_timeout") or args.get("timeout_s", 0) + 15) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         try:
@@ -309,6 +309,30 @@ def cmd_council(args, cfg):
         print(f"  {c['id']:<12} {c['tier']:<8} {c['model']:<18} {c['status']:<8} {c['role']}\n      {c['brief'][:120]}")
 
 
+def cmd_hook(args, cfg):
+    """Called by Claude Code hooks. Never fail or slow the session: errors -> silent no-op."""
+    from .claude_hooks import session_start
+
+    if args.event != "session-start":
+        return
+    try:
+        cfg = {**cfg, "_timeout": 3}
+        out = session_start(sys.stdin.read(), cfg, call)
+        if out:
+            print(out)
+    except Exception as e:  # hub down, not configured, etc.
+        print(f"memyselfandi hook skipped: {e}", file=sys.stderr)
+
+
+def cmd_install_claude(args, cfg):
+    from .claude_hooks import install, uninstall
+
+    for line in (uninstall() if args.uninstall else install(cfg, dry_run=args.dry_run)):
+        print(("would set: " if args.dry_run else "") + line)
+    if not args.uninstall:
+        print("new Claude Code sessions in a registered project will now check in with its organizer")
+
+
 def cmd_mcp_setup(args, cfg):
     """Print (or run) the commands that point this machine's agents at the hub."""
     url = cfg["url"].rstrip("/") + "/mcp"
@@ -400,6 +424,15 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("mcp-setup", help="print/apply config that connects Claude Code + Codex to the hub")
     s.add_argument("--apply", action="store_true", help="run the `claude mcp add` command")
     s.set_defaults(fn=cmd_mcp_setup)
+
+    s = sub.add_parser("hook", help="(used by Claude Code hooks)")
+    s.add_argument("event", choices=["session-start"])
+    s.set_defaults(fn=cmd_hook)
+
+    s = sub.add_parser("install-claude", help="connect this machine's Claude Code: MCP server + SessionStart hook")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--uninstall", action="store_true")
+    s.set_defaults(fn=cmd_install_claude)
 
     sub.add_parser("status", help="board: online agents + open tasks").set_defaults(fn=cmd_status)
 

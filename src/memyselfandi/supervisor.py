@@ -131,7 +131,9 @@ class Supervisor:
         sp = self.run_dir / f"{window_name(agent_id)}.system.md"
         sp.write_text(system_prompt)
         # Positional prompt first: --allowedTools / --mcp-config are variadic and would swallow it.
+        role = "organizer" if agent_id.startswith("org-") else "council"
         return [
+            "env", f"MMI_ROLE={role}", f"MMI_AGENT_ID={agent_id}",
             self.claude_bin, first_message,
             "--model", model,
             "--name", label,
