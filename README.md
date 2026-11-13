@@ -26,7 +26,7 @@ plate, and they hand work back out.
 ## How it works
 
 - **Projects** are registered on the hub with a repo path (`mmi project add`). Each gets 1+ organizers.
-- **Workers** connect to the hub as an MCP server. Its built-in instructions tell them the protocol:
+- **Workers** opt in with the `/memyselfandi` skill. Then they follow the protocol:
   1. `register`
   2. `ask_organizer(kind="checkin")` and wait for the reply, which is the briefing plus an assignment
   3. Work.
@@ -62,7 +62,7 @@ uv run mmi config --new-hub-token            # token in ~/.config/memyselfandi/c
 uv run mmi up                                # hub + supervisor in tmux session "mmi"
 uv run mmi project add myapp --path ~/projects/myapp -d "what this project is"
 uv run mmi attach org-myapp-1                # first time per repo: accept Claude Code's folder-trust prompt
-uv run mmi mcp-setup --apply                 # point this machine's own Claude Code at the hub
+uv run mmi install-claude                    # this machine's Claude Code: MCP server + /memyselfandi skill
 ```
 
 Optional `~/.config/memyselfandi/config.json` keys:
@@ -78,10 +78,21 @@ creates the `mmi` tmux session for the agents.
 ```bash
 git clone <this repo> && cd memyselfandi && uv sync
 uv run mmi config --url http://jacob-erard-desktop:7377 --token <`mmi config --show-token` on the PC>
-uv run mmi mcp-setup --apply                 # Claude Code; also prints the Codex config.toml block
+uv run mmi install-claude                    # Claude Code (`mmi mcp-setup` prints the Codex config block)
 ```
 
-Then start any agent in a project and tell it: *"check in with the memyselfandi organizer for myapp"*.
+### Connecting a session (opt-in)
+
+Sessions **don't** go through the organizer unless you ask. In any Claude Code session, run `/memyselfandi`
+or say *"check in with the organizer"*. The skill runs `mmi connect`, which:
+- figures out the project from the directory, or takes the name you give it
+- registers the session as a worker
+- hands it the protocol: check in, wait for the briefing, work, then hand off before finishing
+
+A directory matches a project in one of three ways:
+- it's under the project's path on the hub
+- its git repo folder has the project's name
+- it's listed in the `"projects": {"/local/path": "name"}` mapping in `~/.config/memyselfandi/config.json`
 
 ### Day to day
 
@@ -123,7 +134,7 @@ Other machines only talk to it over HTTP; nothing is synced.
 
 ## Roadmap
 
-- Hooks so Claude Code sessions auto-register and check in on start, and hand off on exit
+- Prompt a handoff when a connected session ends
 - Recycle long-running organizer sessions (fresh context, rebuilt from the ledger)
 - Offline mode for the laptop when the hub is unreachable
 - Small web dashboard for the ledger and queue

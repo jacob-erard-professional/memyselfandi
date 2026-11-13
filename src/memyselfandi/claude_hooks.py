@@ -1,5 +1,5 @@
-"""Claude Code integration: a SessionStart hook that connects every new session to its project's organizer,
-plus an installer that wires the MCP server, the hook, and a permission rule into ~/.claude/settings.json."""
+"""Claude Code integration. Opt-in: a session only connects to an organizer when you invoke the
+`/memyselfandi` skill (or ask for it). The installer adds the MCP server, the skill, and a permission rule."""
 
 from __future__ import annotations
 
@@ -12,8 +12,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-CLAUDE_SETTINGS = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "settings.json"
-HOOK_MARKER = "memyselfandi.cli hook session-start"
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+CLAUDE_SETTINGS = CLAUDE_DIR / "settings.json"
+SKILL_DIR = CLAUDE_DIR / "skills" / "memyselfandi"
+HOOK_MARKER = "memyselfandi.cli hook session-start"  # earlier versions installed an auto-check-in hook
 
 
 def _git_root(cwd: str) -> Path | None:
@@ -52,56 +54,76 @@ def resolve_project(cwd: str, projects: list[dict[str, Any]], mapping: dict[str,
     return None
 
 
-def context_for(agent_id: str, project: str, machine: str, source: str) -> str:
-    resumed = source in ("resume", "compact")
+def protocol(agent_id: str, project: str, machine: str) -> str:
     return f"""\
-[memyselfandi] This Claude Code session is connected to the memyselfandi hub as worker agent `{agent_id}`
-on machine `{machine}`, in project `{project}`. That project has an ORGANIZER agent that coordinates all
-agents across the user's machines and remembers where work left off. Use the `memyselfandi` MCP tools,
-passing agent_id="{agent_id}" and project="{project}". You're already registered.
+Connected to memyselfandi as worker `{agent_id}` on `{machine}`, project `{project}`.
+Pass agent_id="{agent_id}" and project="{project}" to the memyselfandi MCP tools.
 
-{"You were resumed or compacted. If you already checked in this session, continue your assignment; otherwise check in."
- if resumed else "Before starting work, check in:"}
-- ask_organizer(kind="checkin", blocking=true, body=<what the user asked you to do in this session, or "ready
-  for work" if nothing yet, plus anything notable you see>) then wait_for_reply until answered. The reply
-  is your briefing: context from earlier agents and your assignment.
-- The user's direct instructions in this session take precedence over the organizer's. If the user asked
-  for something specific, tell the organizer in your check-in and do what the user asked.
-- Questions for the organizer: blocking=true only if the answer is the ONLY thing unblocking you; otherwise
-  blocking=false, keep working, and check_ticket later.
-- Before you finish or the session ends: ask_organizer(kind="report" or "handoff") with what's done, what's
-  left, and where (paths, branches, task ids), so the next agent can continue.
+1. Check in: ask_organizer(kind="checkin", blocking=true, body=<what the user wants from this session, or
+   "ready for work", plus anything notable>), then wait_for_reply until status is answered (call it again
+   while it's queued / with_organizer / delegated). The reply is your briefing and assignment.
+2. The user's instructions in this session take precedence over the organizer's. If they asked for
+   something specific, say so in the check-in and do what they asked.
+3. Questions: blocking=true only if the answer is the ONLY thing unblocking you; otherwise blocking=false,
+   keep working, and check_ticket later. heartbeat(status=...) when your focus changes.
+4. Before you finish: ask_organizer(kind="report" or "handoff") with what's done, what's left, and where
+   (paths, branches, task ids), so the next agent can continue.
 """
 
 
-def session_start(stdin_text: str, cfg: dict[str, Any], call) -> str:
-    """Hook entrypoint. Returns the JSON for stdout, or "" when this session isn't ours. Must never block a
-    session from starting, so callers swallow errors."""
-    if os.environ.get("MMI_ROLE"):  # organizer/council sessions launched by the supervisor
-        return ""
-    data = json.loads(stdin_text or "{}")
-    cwd = data.get("cwd") or os.getcwd()
-    project = resolve_project(cwd, call(cfg, "list_projects"), cfg.get("projects", {}))
+def connect(cfg: dict[str, Any], call, cwd: str, project: str | None = None) -> dict[str, Any]:
+    """Register this session as a worker on the project for `cwd` (or the named one)."""
+    projects = call(cfg, "list_projects")
+    names = sorted(p["name"] for p in projects)
+    if project and project not in names:
+        raise LookupError(f"no project {project!r}; projects: {', '.join(names) or '(none)'}")
+    project = project or resolve_project(cwd, projects, cfg.get("projects", {}))
     if not project:
-        return ""
-    session = (data.get("session_id") or str(time.time_ns()))[:8]
-    agent_id = f"cc-{cfg['machine']}-{session}"
+        raise LookupError(f"{cwd} isn't a registered project. Projects: {', '.join(names) or '(none)'}. "
+                          "Pass one explicitly, or the user can run `mmi project add` on the hub.")
+    agent_id = f"cc-{cfg['machine']}-{os.urandom(4).hex()}"
     call(cfg, "register", name=f"claude-code@{cfg['machine']}", machine=cfg["machine"], kind="claude-code",
          project=project, status=f"session in {cwd}", agent_id=agent_id)
-    return json.dumps({"hookSpecificOutput": {
-        "hookEventName": "SessionStart",
-        "additionalContext": context_for(agent_id, project, cfg["machine"], data.get("source", "startup")),
-    }})
+    return {"agent_id": agent_id, "project": project, "machine": cfg["machine"],
+            "instructions": protocol(agent_id, project, cfg["machine"])}
+
+
+SKILL = """\
+---
+name: memyselfandi
+description: Connect this session to the memyselfandi organizer for the current project, to check in for a briefing and assignment, ask the organizer a question, or hand off work to the next agent. Use only when the user asks (e.g. "check in with the organizer", "connect to memyselfandi", "hand this off", /memyselfandi).
+---
+
+# memyselfandi
+
+The user wants this session to work through the project's organizer, an agent that coordinates their agents
+across machines and remembers where work left off.
+
+1. If you're already connected in this session (you have a `cc-...` agent id), skip to step 3.
+2. Connect. Run this command, adding `--project <name>` if the user named a project:
+
+   ```bash
+   {command} connect --cwd "$PWD"
+   ```
+
+   It prints your agent id, the project, and the protocol. If it says the directory isn't a registered
+   project, tell the user which projects exist and ask which one (or whether to skip).
+3. Follow the printed protocol with the `memyselfandi` MCP tools. Usually: check in, wait for the
+   organizer's reply, and relay the briefing to the user.
+
+If the user invoked this to hand off or report, connect if needed, then ask_organizer(kind="handoff") with
+what's done, what's left, and where.
+"""
 
 
 # -- installer ---------------------------------------------------------------
-def hook_command() -> str:
-    return f'"{sys.executable}" -m {HOOK_MARKER}'
+def mmi_command() -> str:
+    return f'"{sys.executable}" -m memyselfandi.cli'
 
 
 def install(cfg: dict[str, Any], dry_run: bool = False) -> list[str]:
-    """Add the hub as a user-scoped MCP server, the SessionStart hook, and allow its tools without prompts.
-    Idempotent; backs up settings.json before changing it."""
+    """Add the hub as a user-scoped MCP server, the /memyselfandi skill, and allow its tools without prompts.
+    Removes the auto-check-in hook older versions installed. Idempotent; backs up settings.json first."""
     done = []
     url = cfg["url"].rstrip("/") + "/mcp"
     mcp = ["claude", "mcp", "add", "--scope", "user", "--transport", "http", "memyselfandi", url]
@@ -118,7 +140,10 @@ def install(cfg: dict[str, Any], dry_run: bool = False) -> list[str]:
     before = json.dumps(settings, sort_keys=True)
     entries = settings.setdefault("hooks", {}).setdefault("SessionStart", [])
     entries[:] = [e for e in entries if not any(HOOK_MARKER in h.get("command", "") for h in e.get("hooks", []))]
-    entries.append({"matcher": "*", "hooks": [{"type": "command", "command": hook_command(), "timeout": 10}]})
+    if not entries:
+        del settings["hooks"]["SessionStart"]
+    if not settings["hooks"]:
+        del settings["hooks"]
     allow = settings.setdefault("permissions", {}).setdefault("allow", [])
     if "mcp__memyselfandi" not in allow:
         allow.append("mcp__memyselfandi")
@@ -127,7 +152,11 @@ def install(cfg: dict[str, Any], dry_run: bool = False) -> list[str]:
             shutil.copy2(CLAUDE_SETTINGS, CLAUDE_SETTINGS.with_suffix(f".json.bak-mmi-{time.strftime('%Y%m%d%H%M%S')}"))
         CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
         CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
-    done.append(f"SessionStart hook + allow rule 'mcp__memyselfandi' in {CLAUDE_SETTINGS}")
+    done.append(f"allow rule 'mcp__memyselfandi' in {CLAUDE_SETTINGS} (no auto-check-in hook)")
+    if not dry_run:
+        SKILL_DIR.mkdir(parents=True, exist_ok=True)
+        (SKILL_DIR / "SKILL.md").write_text(SKILL.replace("{command}", mmi_command()))
+    done.append(f"skill /memyselfandi in {SKILL_DIR}")
     return done
 
 
@@ -141,4 +170,5 @@ def uninstall() -> list[str]:
         if "mcp__memyselfandi" in allow:
             allow.remove("mcp__memyselfandi")
         CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
-    return ["removed MCP server, hook, and allow rule"]
+    shutil.rmtree(SKILL_DIR, ignore_errors=True)
+    return ["removed MCP server, skill, allow rule (and any old hook)"]

@@ -23,6 +23,9 @@ DEFAULT_DB = Path(os.environ.get("MMI_DB", DATA_DIR / "hub.db"))
 MAX_WAIT_S = 240  # keep long-polls under typical MCP client tool timeouts
 
 INSTRUCTIONS = """\
+OPT-IN: don't use these tools unless the user asks this session to work with the memyselfandi organizer
+(e.g. "check in with the organizer", or the /memyselfandi skill). Otherwise ignore this server.
+
 memyselfandi coordinates all of the user's agents across their machines. Each project has an ORGANIZER
 agent that owns the plan and the project's memory (the ledger). You talk to it by queueing tickets, and it
 answers in order (first come, first served). That's how you find out what to work on and pick up where
