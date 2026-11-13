@@ -97,7 +97,9 @@ def render_skill() -> str:
 
 # -- installer ---------------------------------------------------------------
 def mmi_command() -> str:
-    return f'"{sys.executable}" -m memyselfandi.cli'
+    """This environment's interpreter, spelled the same however mmi was launched (python vs python3)."""
+    exe = Path(sys.prefix) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    return f'"{exe if exe.exists() else sys.executable}" -m memyselfandi.cli'
 
 
 def install(cfg: dict[str, Any], dry_run: bool = False) -> list[str]:
