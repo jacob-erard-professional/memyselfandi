@@ -6,7 +6,9 @@ module so the rules (atomic claims, heartbeat staleness) live in one place.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import sqlite3
 import threading
 import time
@@ -141,6 +143,15 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "WHERE status IN ('answered', 'cancelled')",
         "CREATE INDEX IF NOT EXISTS idx_tickets_closed ON tickets(closed_at)",
         "CREATE INDEX IF NOT EXISTS idx_tickets_project ON tickets(project)",
+    ]),
+    (3, "per-person invite tokens that expire", [
+        """CREATE TABLE invites (
+            name         TEXT PRIMARY KEY,
+            token_sha256 TEXT NOT NULL UNIQUE,
+            created_at   REAL NOT NULL,
+            expires_at   REAL NOT NULL,
+            revoked_at   REAL
+        )""",
     ]),
 ]
 SCHEMA_VERSION = max([1, *(v for v, _, _ in MIGRATIONS)])
@@ -677,6 +688,48 @@ class Store:
         self.update_ledger(c["project"], council_id, entry=f"council '{c['role']}' reported: {report[:500]}",
                            kind="council")
         return self.enqueue(c["project"], council_id, report, kind="council_report", task_id=c["ticket_id"])
+
+    # -- invites (time-limited access for other people) ---------------------
+    @staticmethod
+    def _hash(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def create_invite(self, name: str, days: float) -> dict[str, Any]:
+        """Issue (or re-issue) a token for `name` that stops working after `days`. Only the hash is stored,
+        so the token is shown once."""
+        if days <= 0:
+            raise ValueError("days must be positive")
+        token = "mmi_" + secrets.token_urlsafe(24)
+        now = time.time()
+        self._x(
+            """INSERT INTO invites (name, token_sha256, created_at, expires_at) VALUES (?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET token_sha256=excluded.token_sha256, created_at=excluded.created_at,
+                   expires_at=excluded.expires_at, revoked_at=NULL""",
+            (name, self._hash(token), now, now + days * 86400),
+        )
+        return {**self._invite(name), "token": token}
+
+    def _invite(self, name: str) -> dict[str, Any]:
+        rows = self._q("SELECT name, created_at, expires_at, revoked_at FROM invites WHERE name=?", (name,))
+        if not rows:
+            raise NotFound(f"no invite for {name!r}")
+        inv = rows[0]
+        inv["active"] = inv["revoked_at"] is None and inv["expires_at"] > time.time()
+        return inv
+
+    def list_invites(self) -> list[dict[str, Any]]:
+        return [self._invite(r["name"]) for r in self._q("SELECT name FROM invites ORDER BY expires_at")]
+
+    def revoke_invite(self, name: str) -> dict[str, Any]:
+        self._invite(name)
+        self._x("UPDATE invites SET revoked_at=? WHERE name=? AND revoked_at IS NULL", (time.time(), name))
+        return self._invite(name)
+
+    def check_invite(self, token: str) -> str | None:
+        """The invitee's name if `token` is a live invite token. Read-only (no disk write per request)."""
+        rows = self._q("SELECT name FROM invites WHERE token_sha256=? AND revoked_at IS NULL AND expires_at > ?",
+                       (self._hash(token), time.time()))
+        return rows[0]["name"] if rows else None
 
     # -- overview ----------------------------------------------------------
     def snapshot(self) -> dict[str, Any]:

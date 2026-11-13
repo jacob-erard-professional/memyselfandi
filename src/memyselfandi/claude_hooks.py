@@ -15,7 +15,17 @@ from typing import Any
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 CLAUDE_SETTINGS = CLAUDE_DIR / "settings.json"
-SKILL_DIR = CLAUDE_DIR / "skills" / "memyselfandi"
+def server_name() -> str:
+    """MCP server / skill name: 'memyselfandi', or 'memyselfandi-<profile>' for a second hub on this machine."""
+    profile = os.environ.get("MMI_PROFILE")
+    return f"memyselfandi-{profile}" if profile else "memyselfandi"
+
+
+def skill_dir() -> Path:
+    return CLAUDE_DIR / "skills" / server_name()
+
+
+SKILL_DIR = None  # resolved at call time via skill_dir(); kept for tests that patch it
 HOOK_MARKER = "memyselfandi.cli hook session-start"  # earlier versions installed an auto-check-in hook
 
 
@@ -58,7 +68,7 @@ def resolve_project(cwd: str, projects: list[dict[str, Any]], mapping: dict[str,
 def protocol(agent_id: str, project: str, machine: str) -> str:
     return f"""\
 Connected to memyselfandi as worker `{agent_id}` on `{machine}`, project `{project}`.
-Pass agent_id="{agent_id}" and project="{project}" to the memyselfandi MCP tools.
+Pass agent_id="{agent_id}" and project="{project}" to the `{server_name()}` MCP tools.
 
 1. Check in: ask_organizer(kind="checkin", blocking=true, body=<what the user wants from this session, or
    "ready for work", plus anything notable>), then wait_for_reply until status is answered (call it again
@@ -92,7 +102,9 @@ def connect(cfg: dict[str, Any], call, cwd: str, project: str | None = None) -> 
 def render_skill() -> str:
     """The /memyselfandi skill as installed: prompts/skill.md with this machine's mmi command filled in."""
     template = resources.files("memyselfandi").joinpath("prompts", "skill.md").read_text()
-    return template.replace("{command}", mmi_command())
+    profile = os.environ.get("MMI_PROFILE")
+    command = mmi_command() + (f" --profile {profile}" if profile else "")
+    return template.replace("{command}", command).replace("{server}", server_name())
 
 
 # -- installer ---------------------------------------------------------------
@@ -107,15 +119,16 @@ def install(cfg: dict[str, Any], dry_run: bool = False) -> list[str]:
     Removes the auto-check-in hook older versions installed. Idempotent; backs up settings.json first."""
     done = []
     url = cfg["url"].rstrip("/") + "/mcp"
-    mcp = ["claude", "mcp", "add", "--scope", "user", "--transport", "http", "memyselfandi", url]
+    name = server_name()
+    mcp = ["claude", "mcp", "add", "--scope", "user", "--transport", "http", name, url]
     if cfg.get("token"):
         mcp += ["--header", f"Authorization: Bearer {cfg['token']}"]
     if not dry_run:
         if not shutil.which("claude"):
             raise RuntimeError("claude CLI not found on PATH")
-        subprocess.run(["claude", "mcp", "remove", "--scope", "user", "memyselfandi"], capture_output=True)
+        subprocess.run(["claude", "mcp", "remove", "--scope", "user", name], capture_output=True)
         subprocess.run(mcp, check=True, capture_output=True)
-    done.append(f"MCP server 'memyselfandi' -> {url} (user scope)")
+    done.append(f"MCP server '{name}' -> {url} (user scope)")
 
     settings = json.loads(CLAUDE_SETTINGS.read_text()) if CLAUDE_SETTINGS.exists() else {}
     before = json.dumps(settings, sort_keys=True)
@@ -126,30 +139,32 @@ def install(cfg: dict[str, Any], dry_run: bool = False) -> list[str]:
     if not settings["hooks"]:
         del settings["hooks"]
     allow = settings.setdefault("permissions", {}).setdefault("allow", [])
-    if "mcp__memyselfandi" not in allow:
-        allow.append("mcp__memyselfandi")
+    if f"mcp__{name}" not in allow:
+        allow.append(f"mcp__{name}")
     if json.dumps(settings, sort_keys=True) != before and not dry_run:
         if CLAUDE_SETTINGS.exists():
             shutil.copy2(CLAUDE_SETTINGS, CLAUDE_SETTINGS.with_suffix(f".json.bak-mmi-{time.strftime('%Y%m%d%H%M%S')}"))
         CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
         CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
-    done.append(f"allow rule 'mcp__memyselfandi' in {CLAUDE_SETTINGS} (no auto-check-in hook)")
+    done.append(f"allow rule 'mcp__{name}' in {CLAUDE_SETTINGS} (no auto-check-in hook)")
+    target = SKILL_DIR or skill_dir()
     if not dry_run:
-        SKILL_DIR.mkdir(parents=True, exist_ok=True)
-        (SKILL_DIR / "SKILL.md").write_text(render_skill())
-    done.append(f"skill /memyselfandi in {SKILL_DIR}")
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "SKILL.md").write_text(render_skill())
+    done.append(f"skill /{name} in {target}")
     return done
 
 
 def uninstall() -> list[str]:
-    subprocess.run(["claude", "mcp", "remove", "--scope", "user", "memyselfandi"], capture_output=True)
+    name = server_name()
+    subprocess.run(["claude", "mcp", "remove", "--scope", "user", name], capture_output=True)
     if CLAUDE_SETTINGS.exists():
         settings = json.loads(CLAUDE_SETTINGS.read_text())
         entries = settings.get("hooks", {}).get("SessionStart", [])
         entries[:] = [e for e in entries if not any(HOOK_MARKER in h.get("command", "") for h in e.get("hooks", []))]
         allow = settings.get("permissions", {}).get("allow", [])
-        if "mcp__memyselfandi" in allow:
-            allow.remove("mcp__memyselfandi")
+        if f"mcp__{name}" in allow:
+            allow.remove(f"mcp__{name}")
         CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
-    shutil.rmtree(SKILL_DIR, ignore_errors=True)
+    shutil.rmtree(SKILL_DIR or skill_dir(), ignore_errors=True)
     return ["removed MCP server, skill, allow rule (and any old hook)"]

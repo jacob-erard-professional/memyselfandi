@@ -37,7 +37,10 @@ COUNCIL_MAX_S = 90 * 60     # council members are dismissed after this long
 HEARTBEAT_EVERY_S = 120    # throttle organizer heartbeats: each one is a disk write
 COUNCIL_LINGER_S = 30       # keep a finished council window around briefly so you can glance at it
 
-SESSION_TOOLS = "mcp__memyselfandi,Read,Grep,Glob"
+def session_tools(project_path: str) -> str:
+    """Hub tools + Read limited to the project folder. A bare "Read" lets the session read any file you can
+    (verified), and tickets can come from other people's agents, so never widen this."""
+    return f"mcp__memyselfandi,Read(//{str(Path(project_path).resolve()).lstrip('/')}/**)"
 
 
 class Runner(Protocol):
@@ -127,7 +130,8 @@ class Supervisor:
         path.chmod(0o600)
         return path
 
-    def _argv(self, agent_id: str, model: str, system_prompt: str, first_message: str, label: str) -> list[str]:
+    def _argv(self, agent_id: str, model: str, system_prompt: str, first_message: str, label: str,
+              project_path: str) -> list[str]:
         sp = self.run_dir / f"{window_name(agent_id)}.system.md"
         sp.write_text(system_prompt)
         # Positional prompt first: --allowedTools / --mcp-config are variadic and would swallow it.
@@ -140,7 +144,7 @@ class Supervisor:
             "--permission-mode", "dontAsk",
             "--strict-mcp-config",
             "--append-system-prompt-file", str(sp),
-            "--allowedTools", SESSION_TOOLS,
+            "--allowedTools", session_tools(project_path),
             "--mcp-config", str(self.mcp_config),
         ]
 
@@ -189,7 +193,7 @@ class Supervisor:
         first = (f"You're online as organizer {agent_id} for {project['name']}. "
                  f"Call organizer_next(agent_id='{agent_id}', project='{project['name']}') and work the queue "
                  "until it's empty, then wait.")
-        argv = self._argv(agent_id, ORGANIZER_MODEL, system, first, f"organizer:{project['name']}")
+        argv = self._argv(agent_id, ORGANIZER_MODEL, system, first, f"organizer:{project['name']}", project["path"])
         self.runner.launch(window_name(agent_id), project["path"], argv)
         self.windows[agent_id] = project["name"]
         self.launched_at[agent_id] = self.last_nudge[agent_id] = now
@@ -241,7 +245,7 @@ class Supervisor:
             brief=c["brief"], ticket_section=ticket_section,
         )
         first = f"You're council member {c['id']}. Do your brief now and finish with council_report."
-        argv = self._argv(c["id"], c["model"], system, first, f"council:{c['role']}")
+        argv = self._argv(c["id"], c["model"], system, first, f"council:{c['role']}", project["path"])
         self.runner.launch(window_name(c["id"]), project["path"], argv)
         self.windows[c["id"]] = c["project"]
         self.store.set_council_status(c["id"], "running")

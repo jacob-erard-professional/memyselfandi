@@ -63,3 +63,13 @@ def test_install_adds_skill_and_removes_old_auto_hook(tmp_path, monkeypatch):
     claude_hooks.uninstall()
     assert not (tmp_path / "skills" / "memyselfandi").exists()
     assert "mcp__memyselfandi" not in json.loads(settings.read_text())["permissions"]["allow"]
+
+
+def test_profile_gets_its_own_mcp_server_and_skill(monkeypatch):
+    monkeypatch.setenv("MMI_PROFILE", "collab")
+    assert claude_hooks.server_name() == "memyselfandi-collab"
+    assert claude_hooks.skill_dir().name == "memyselfandi-collab"
+    skill = claude_hooks.render_skill()
+    assert "name: memyselfandi-collab" in skill and "connect --cwd" in skill and "--profile collab" in skill
+    monkeypatch.delenv("MMI_PROFILE")
+    assert claude_hooks.server_name() == "memyselfandi" and "--profile" not in claude_hooks.render_skill()

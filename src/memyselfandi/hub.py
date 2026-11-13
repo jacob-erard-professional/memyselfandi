@@ -333,6 +333,9 @@ def build_server(store: Store) -> MCPServer:
             "remove_agent": lambda: store.remove_agent(**args) or {"ok": True},
             "project_rows": lambda: store.project_rows(**args),
             "delete_project": lambda: store.delete_project(**args),
+            "create_invite": lambda: store.create_invite(**args),
+            "list_invites": lambda: store.list_invites(),
+            "revoke_invite": lambda: store.revoke_invite(**args),
         }
         if request.path_params["op"] not in ops:
             return JSONResponse({"error": "no such op"}, status_code=404)
@@ -345,18 +348,25 @@ def build_server(store: Store) -> MCPServer:
 
 
 class TokenAuth:
-    """Optional shared-secret bearer auth (MMI_TOKEN). /health stays public."""
+    """Bearer auth. The hub token (yours) can do everything; a live invite token (`mmi invite`) can use the
+    agent tools but not /api/admin. /health stays public. With no hub token configured, auth is off."""
 
-    def __init__(self, app, token: str):
-        self.app, self.token = app, token.encode()
+    def __init__(self, app, token: str | None, store: Store):
+        self.app, self.token, self.store = app, token.encode() if token else None, store
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"] != "/health":
-            headers = dict(scope.get("headers") or [])
-            got = headers.get(b"authorization", b"")
+        if scope["type"] == "http" and self.token and scope["path"] != "/health":
+            got = dict(scope.get("headers") or []).get(b"authorization", b"")
             if not hmac.compare_digest(got, b"Bearer " + self.token):
-                await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
-                return
+                bearer = got[7:].decode(errors="replace") if got.startswith(b"Bearer ") else ""
+                invitee = self.store.check_invite(bearer) if bearer.startswith("mmi_") else None
+                if invitee is None:
+                    await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
+                    return
+                if scope["path"].startswith("/api/admin"):
+                    await JSONResponse({"error": "invite tokens can't do admin operations"},
+                                       status_code=403)(scope, receive, send)
+                    return
         await self.app(scope, receive, send)
 
 
@@ -365,7 +375,7 @@ def build_app(store: Store, host: str, token: str | None):
     local = host in ("127.0.0.1", "localhost", "::1")
     security = None if local else TransportSecuritySettings(enable_dns_rebinding_protection=False)
     app = mcp.streamable_http_app(host=host, transport_security=security)
-    return TokenAuth(app, token) if token else app
+    return TokenAuth(app, token, store)
 
 
 def start_retention(store: Store, retention_days: float) -> None:

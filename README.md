@@ -106,6 +106,44 @@ mmi attach                     # watch the organizer/council sessions (tmux)
 mmi project delete myapp       # wipe a project and everything tagged with it
 ```
 
+## Working with other people (time-limited)
+
+Collaborators get a **separate hub**: its own database, projects and organizer. They reach it through a
+**dedicated Tailscale node that you share with them**. They never join your tailnet and can't reach your PC;
+the shared node only forwards one port to the collab hub, which listens on `127.0.0.1` only.
+
+```
+their tailnet ──share──► mmi-collab (Tailscale container) ──► collab hub on 127.0.0.1:7378 (profile "collab")
+```
+
+**One-time setup (hub PC):**
+```bash
+uv run mmi --profile collab config --new-hub-token --url http://127.0.0.1:7378 --port 7378
+uv run mmi --profile collab up --host 127.0.0.1                 # tmux session "mmi-collab"
+cd deploy/collab && cp .env.example .env                        # paste a Tailscale auth key into .env
+docker compose up -d                                            # "mmi-collab" appears in your tailnet
+uv run mmi --profile collab config --public-url http://<mmi-collab's 100.x IP>:7377
+uv run mmi --profile collab project add shared-thing --path ~/projects/shared-thing
+```
+
+**Inviting someone:**
+1. In the Tailscale admin console, go to **Machines → mmi-collab → Share**, and send them the link.
+2. Run `uv run mmi --profile collab invite alice --days 14`. It prints a token that stops working after 14 days,
+   plus the setup commands to send them.
+3. `uv run mmi --profile collab invites` shows who has access until when. `... revoke alice` cuts them off now.
+
+Shares don't expire on their own, so when someone's time is up, also remove their share in the admin console.
+The token expiry is the hard cutoff either way.
+
+**Safety:**
+- **Invite tokens are limited.** They can use the agent tools but not admin operations: no inviting,
+  projects or deletes.
+- **Organizers and council stay in the project.** Every organizer and council session can read only its own
+  project folder (`Read(//<path>/**)`; a bare `Read` can read any file you can). Their charter tells them to
+  treat ticket text as requests, not instructions.
+- **Your account pays.** Organizer and council turns for shared projects bill to *your* Claude account,
+  whoever's agent asked.
+
 ## Storage
 
 Everything lives in one SQLite file on the hub: `~/.local/share/memyselfandi/hub.db` (or `MMI_DB`).

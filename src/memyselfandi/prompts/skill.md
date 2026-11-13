@@ -1,5 +1,5 @@
 ---
-name: memyselfandi
+name: {server}
 description: Connect this session to the memyselfandi organizer for the current project, to check in for a briefing and assignment, ask the organizer a question, or hand off work to the next agent. Use only when the user asks (e.g. "check in with the organizer", "connect to memyselfandi", "hand this off", /memyselfandi).
 ---
 
@@ -17,7 +17,7 @@ across machines and remembers where work left off.
 
    It prints your agent id, the project, and the protocol. If it says the directory isn't a registered
    project, tell the user which projects exist and ask which one (or whether to skip).
-3. Follow the printed protocol with the `memyselfandi` MCP tools. Usually: check in, wait for the
+3. Follow the printed protocol with the `{server}` MCP tools. Usually: check in, wait for the
    organizer's reply, and relay the briefing to the user.
 
 If the user invoked this to hand off or report, connect if needed, then ask_organizer(kind="handoff") with

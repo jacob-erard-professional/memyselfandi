@@ -16,6 +16,19 @@ from pathlib import Path
 from typing import Any
 
 CONFIG_PATH = Path(os.environ.get("MMI_CONFIG", Path.home() / ".config/memyselfandi/config.json"))
+PROFILE = os.environ.get("MMI_PROFILE")
+
+
+def use_profile(name: str) -> None:
+    """A profile is a fully separate hub on the same machine (own config, database, tmux session),
+    e.g. `--profile collab` for the hub you share with other people."""
+    global CONFIG_PATH, PROFILE
+    PROFILE = name
+    os.environ["MMI_PROFILE"] = name
+    os.environ.setdefault("MMI_CONFIG", str(Path.home() / f".config/memyselfandi/{name}.json"))
+    os.environ.setdefault("MMI_DATA", str(Path.home() / f".local/share/memyselfandi/{name}"))
+    os.environ.setdefault("MMI_TMUX_SESSION", f"mmi-{name}")
+    CONFIG_PATH = Path(os.environ["MMI_CONFIG"])
 DEFAULT_PORT = 7377
 
 
@@ -128,7 +141,7 @@ def cmd_serve(args, cfg):
     from .hub import DEFAULT_DB, serve
 
     token = os.environ.get("MMI_TOKEN") or cfg.get("hub_token")
-    serve(args.host, args.port, Path(args.db or DEFAULT_DB), token, supervise=not args.no_supervise,
+    serve(args.host, args.port or cfg.get("port") or DEFAULT_PORT, Path(args.db or DEFAULT_DB), token, supervise=not args.no_supervise,
           tiers=cfg.get("tiers"), retention_days=cfg.get("retention_days"))
 
 
@@ -145,7 +158,9 @@ def cmd_up(args, cfg):
     if runner.has_window("hub"):
         print(f"hub already running in tmux session '{TMUX_SESSION}' (window 'hub')")
         return
-    argv = [sys.executable, "-m", "memyselfandi.cli", "serve", "--host", args.host, "--port", str(args.port)]
+    port = args.port or cfg.get("port") or DEFAULT_PORT
+    argv = [sys.executable, "-m", "memyselfandi.cli", *(["--profile", PROFILE] if PROFILE else []),
+            "serve", "--host", args.host, "--port", str(port)]
     runner.launch("hub", str(Path.cwd()), argv)
     print(f"started hub in tmux session '{TMUX_SESSION}'. `mmi attach` to watch, `mmi attach <window>` for one agent")
 
@@ -161,7 +176,7 @@ def cmd_config(args, cfg):
     stored = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
     if args.new_hub_token:
         stored["hub_token"] = stored["token"] = secrets.token_urlsafe(24)
-    for key in ("url", "token", "machine"):
+    for key in ("url", "token", "machine", "public_url", "port"):
         if getattr(args, key) is not None:
             stored[key] = getattr(args, key)
     if stored != (json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}):
@@ -252,6 +267,33 @@ def cmd_project_delete(args, cfg):
             sys.exit("mmi: not deleted")
     admin(cfg, "delete_project", name=args.name)
     print(f"deleted {args.name}")
+
+
+def cmd_invite(args, cfg):
+    inv = admin(cfg, "create_invite", name=args.name, days=args.days)
+    until = time.strftime("%Y-%m-%d %H:%M", time.localtime(inv["expires_at"]))
+    url = cfg.get("public_url") or "<hub url: set with `mmi config --public-url ...`>"
+    print(f"invite for {inv['name']}, valid until {until} (shown once; `mmi revoke {inv['name']}` to cut off early)\n")
+    print("Send them this (after you share the hub's Tailscale node with them):\n")
+    print("  git clone https://github.com/jacob-erard-professional/memyselfandi && cd memyselfandi && uv sync")
+    print(f"  uv run mmi config --url {url} --token {inv['token']} --machine {args.name}")
+    print("  uv run mmi install-claude      # then /memyselfandi in a Claude Code session")
+
+
+def cmd_invites(args, cfg):
+    invites = admin(cfg, "list_invites")
+    if not invites:
+        print("  (no invites)")
+    for i in invites:
+        state = "active" if i["active"] else ("revoked" if i["revoked_at"] else "expired")
+        until = time.strftime("%Y-%m-%d %H:%M", time.localtime(i["expires_at"]))
+        print(f"  {i['name']:<20} {state:<8} until {until}")
+
+
+def cmd_revoke(args, cfg):
+    admin(cfg, "revoke_invite", name=args.name)
+    print(f"revoked {args.name}: their token stops working now. Also remove their Tailscale share "
+          "(admin console > Machines > the shared node > Share).")
 
 
 def cmd_projects(args, cfg):
@@ -352,18 +394,19 @@ def cmd_mcp_setup(args, cfg):
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="mmi", description="memyselfandi: coordinate your agents across machines")
+    p.add_argument("--profile", help="use a separate hub (own config/db/tmux), e.g. 'collab' for the shared one")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("serve", help="run the hub (on the always-on machine)")
     s.add_argument("--host", default=os.environ.get("MMI_HOST", "127.0.0.1"), help="bind address (use your tailscale IP or 0.0.0.0)")
-    s.add_argument("--port", type=int, default=int(os.environ.get("MMI_PORT", DEFAULT_PORT)))
+    s.add_argument("--port", type=int, default=int(os.environ["MMI_PORT"]) if os.environ.get("MMI_PORT") else None)
     s.add_argument("--db", default=None)
     s.add_argument("--no-supervise", action="store_true", help="don't launch organizers/council in tmux")
     s.set_defaults(fn=cmd_serve)
 
     s = sub.add_parser("up", help="start the hub inside tmux session 'mmi' (organizers + council live there too)")
     s.add_argument("--host", default=os.environ.get("MMI_HOST", "0.0.0.0"))
-    s.add_argument("--port", type=int, default=int(os.environ.get("MMI_PORT", DEFAULT_PORT)))
+    s.add_argument("--port", type=int, default=int(os.environ["MMI_PORT"]) if os.environ.get("MMI_PORT") else None)
     s.set_defaults(fn=cmd_up)
 
     s = sub.add_parser("attach", help="attach to the tmux session (optionally one window, e.g. org-myproj-1)")
@@ -383,6 +426,15 @@ def main(argv: list[str] | None = None) -> None:
     pd.add_argument("name")
     pd.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     pd.set_defaults(fn=cmd_project_delete)
+
+    s = sub.add_parser("invite", help="give someone a token that expires (use with --profile collab)")
+    s.add_argument("name", help="who it's for (also their machine name)")
+    s.add_argument("--days", type=float, required=True)
+    s.set_defaults(fn=cmd_invite)
+    sub.add_parser("invites", help="list invites and when they expire").set_defaults(fn=cmd_invites)
+    s = sub.add_parser("revoke", help="revoke someone's invite token now")
+    s.add_argument("name")
+    s.set_defaults(fn=cmd_revoke)
 
     s = sub.add_parser("queue", help="a project's organizer queue")
     s.add_argument("project")
@@ -412,6 +464,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--url")
     s.add_argument("--token")
     s.add_argument("--machine")
+    s.add_argument("--public-url", help="hub URL invitees use (e.g. the shared node's tailnet address)")
+    s.add_argument("--port", type=int, help="port this profile's hub listens on")
     s.add_argument("--new-hub-token", action="store_true", help="generate a token for the hub you serve here")
     s.add_argument("--show-token", action="store_true")
     s.set_defaults(fn=cmd_config)
@@ -477,6 +531,8 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_inbox)
 
     args = p.parse_args(argv)
+    if args.profile:
+        use_profile(args.profile)
     try:
         args.fn(args, load_config())
     except HubError as e:
