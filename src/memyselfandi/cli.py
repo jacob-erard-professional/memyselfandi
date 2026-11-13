@@ -41,10 +41,10 @@ class HubError(RuntimeError):
     pass
 
 
-def call(cfg: dict[str, Any], tool: str, **args: Any) -> Any:
+def call(cfg: dict[str, Any], tool: str, _path: str | None = None, **args: Any) -> Any:
     args = {k: v for k, v in args.items() if v is not None}
     req = urllib.request.Request(
-        cfg["url"].rstrip("/") + f"/api/tool/{tool}",
+        cfg["url"].rstrip("/") + (_path or f"/api/tool/{tool}"),
         data=json.dumps(args).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -52,7 +52,7 @@ def call(cfg: dict[str, Any], tool: str, **args: Any) -> Any:
     if cfg.get("token"):
         req.add_header("Authorization", f"Bearer {cfg['token']}")
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=args.get("timeout_s", 0) + 15) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         try:
@@ -62,6 +62,10 @@ def call(cfg: dict[str, Any], tool: str, **args: Any) -> Any:
         raise HubError(f"{e.code}: {msg}") from None
     except urllib.error.URLError as e:
         raise HubError(f"can't reach hub at {cfg['url']} ({e.reason}). Is it running? Check `mmi config`.") from None
+
+
+def admin(cfg: dict[str, Any], op: str, **args: Any) -> Any:
+    return call(cfg, op, _path=f"/api/admin/{op}", **args)
 
 
 def me(cfg: dict[str, Any]) -> str:
@@ -124,7 +128,33 @@ def cmd_serve(args, cfg):
     from .hub import DEFAULT_DB, serve
 
     token = os.environ.get("MMI_TOKEN") or cfg.get("hub_token")
-    serve(args.host, args.port, Path(args.db or DEFAULT_DB), token)
+    serve(args.host, args.port, Path(args.db or DEFAULT_DB), token, supervise=not args.no_supervise,
+          tiers=cfg.get("tiers"))
+
+
+def cmd_up(args, cfg):
+    """Start the hub in a tmux session (`mmi`), where organizers and council will also live."""
+    import shutil
+    import subprocess
+
+    from .supervisor import TMUX_SESSION, TmuxRunner
+
+    if not shutil.which("tmux"):
+        sys.exit("mmi: tmux is required for `mmi up`")
+    runner = TmuxRunner()
+    if runner.has_window("hub"):
+        print(f"hub already running in tmux session '{TMUX_SESSION}' (window 'hub')")
+        return
+    argv = [sys.executable, "-m", "memyselfandi.cli", "serve", "--host", args.host, "--port", str(args.port)]
+    runner.launch("hub", str(Path.cwd()), argv)
+    print(f"started hub in tmux session '{TMUX_SESSION}'. `mmi attach` to watch, `mmi attach <window>` for one agent")
+
+
+def cmd_attach(args, cfg):
+    from .supervisor import TMUX_SESSION, window_name
+
+    target = TMUX_SESSION + (f":{window_name(args.window)}" if args.window else "")
+    os.execvp("tmux", ["tmux", "attach", "-t", target])
 
 
 def cmd_config(args, cfg):
@@ -148,7 +178,10 @@ def cmd_config(args, cfg):
 def cmd_status(args, cfg):
     agent_id = me(cfg)
     board = call(cfg, "get_board", agent_id=agent_id)
-    print("AGENTS (online)")
+    print("PROJECTS")
+    for p in board.get("projects", []):
+        print(f"  {p['name']:<20} {p['queued']} queued")
+    print("\nAGENTS (online)")
     print(fmt_agents([a for a in board["agents"] if a["kind"] != "human"]))
     print("\nTASKS")
     print(fmt_tasks(board["tasks"]))
@@ -202,6 +235,69 @@ def cmd_inbox(args, cfg):
     print(fmt_messages(call(cfg, "read_inbox", agent_id=me(cfg), include_read=args.all)))
 
 
+def cmd_project_add(args, cfg):
+    path = str(Path(args.path).expanduser().resolve())
+    p = admin(cfg, "add_project", name=args.name, path=path, description=args.description or "",
+              organizers=args.organizers)
+    print(f"project {p['name']} -> {p['path']} ({p['organizers']} organizer(s)); the hub will start its organizer")
+    print(f"first time only: Claude Code asks whether to trust {p['path']}. `mmi attach org-{p['name']}-1` and answer it")
+
+
+def cmd_projects(args, cfg):
+    for p in call(cfg, "list_projects"):
+        print(f"  {p['name']:<20} {p['queued']} queued   {p['path']}")
+
+
+def fmt_tickets(tickets: list[dict]) -> str:
+    if not tickets:
+        return "  (queue empty)"
+    out = []
+    for t in tickets:
+        where = f"#{t['position']} in line" if t["status"] == "queued" else f"{t['status']} by {t['handler']}"
+        flag = " BLOCKING" if t["blocking"] else ""
+        out.append(f"  {t['id']:<11} {t['kind']:<14} from {t['asker']:<16} {where}{flag}\n      {t['body'][:120]}")
+    return "\n".join(out)
+
+
+def cmd_queue(args, cfg):
+    print(fmt_tickets(call(cfg, "list_queue", project=args.project)))
+
+
+def cmd_ask(args, cfg):
+    t = call(cfg, "ask_organizer", agent_id=me(cfg), project=args.project, body=" ".join(args.body),
+             kind=args.kind, blocking=args.wait)
+    print(f"queued {t['id']} (#{t['position']} in line)")
+    if args.wait:
+        while t["status"] not in ("answered", "cancelled"):
+            t = call(cfg, "wait_for_reply", ticket_id=t["id"], timeout_s=60)
+            if t["status"] != "answered":
+                print(f"  ...{t['status']}" + (f" (#{t['position']})" if t.get("position") else ""))
+        print(f"\n{t['answered_by']}:\n{t['reply']}")
+
+
+def cmd_ticket(args, cfg):
+    t = call(cfg, "check_ticket", ticket_id=args.ticket)
+    print(fmt_tickets([t]) if t["status"] != "answered" else f"{t['answered_by']}:\n{t['reply']}")
+
+
+def cmd_ledger(args, cfg):
+    led = call(cfg, "get_ledger", project=args.project)
+    print(led["summary"] or "(no summary yet)")
+    if led["log"]:
+        print("\nRECENT LOG")
+        for e in led["log"]:
+            print(f"  {time.strftime('%m-%d %H:%M', time.localtime(e['created_at']))} [{e['kind']}] "
+                  f"{e['author']}: {e['body'][:200]}")
+
+
+def cmd_council(args, cfg):
+    members = call(cfg, "list_council", project=args.project, include_finished=args.all)
+    if not members:
+        print("  (no council members)")
+    for c in members:
+        print(f"  {c['id']:<12} {c['tier']:<8} {c['model']:<18} {c['status']:<8} {c['role']}\n      {c['brief'][:120]}")
+
+
 def cmd_mcp_setup(args, cfg):
     """Print (or run) the commands that point this machine's agents at the hub."""
     url = cfg["url"].rstrip("/") + "/mcp"
@@ -232,7 +328,51 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--host", default=os.environ.get("MMI_HOST", "127.0.0.1"), help="bind address (use your tailscale IP or 0.0.0.0)")
     s.add_argument("--port", type=int, default=int(os.environ.get("MMI_PORT", DEFAULT_PORT)))
     s.add_argument("--db", default=None)
+    s.add_argument("--no-supervise", action="store_true", help="don't launch organizers/council in tmux")
     s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("up", help="start the hub inside tmux session 'mmi' (organizers + council live there too)")
+    s.add_argument("--host", default=os.environ.get("MMI_HOST", "0.0.0.0"))
+    s.add_argument("--port", type=int, default=int(os.environ.get("MMI_PORT", DEFAULT_PORT)))
+    s.set_defaults(fn=cmd_up)
+
+    s = sub.add_parser("attach", help="attach to the tmux session (optionally one window, e.g. org-myproj-1)")
+    s.add_argument("window", nargs="?")
+    s.set_defaults(fn=cmd_attach)
+
+    s = sub.add_parser("project", help="register a project (gives it an organizer)")
+    psub = s.add_subparsers(dest="pcmd", required=True)
+    pa = psub.add_parser("add")
+    pa.add_argument("name")
+    pa.add_argument("--path", required=True, help="repo path on the hub machine")
+    pa.add_argument("-d", "--description")
+    pa.add_argument("--organizers", type=int, default=1)
+    pa.set_defaults(fn=cmd_project_add)
+    psub.add_parser("list").set_defaults(fn=cmd_projects)
+
+    s = sub.add_parser("queue", help="a project's organizer queue")
+    s.add_argument("project")
+    s.set_defaults(fn=cmd_queue)
+
+    s = sub.add_parser("ask", help="queue a ticket for a project's organizer (as you)")
+    s.add_argument("project")
+    s.add_argument("body", nargs="+")
+    s.add_argument("-k", "--kind", default="question", choices=["checkin", "question", "report", "handoff"])
+    s.add_argument("-w", "--wait", action="store_true", help="wait for the reply")
+    s.set_defaults(fn=cmd_ask)
+
+    s = sub.add_parser("ticket", help="check a ticket / read its reply")
+    s.add_argument("ticket")
+    s.set_defaults(fn=cmd_ticket)
+
+    s = sub.add_parser("ledger", help="a project's living summary + recent log")
+    s.add_argument("project")
+    s.set_defaults(fn=cmd_ledger)
+
+    s = sub.add_parser("council", help="council members on a project")
+    s.add_argument("project")
+    s.add_argument("-a", "--all", action="store_true", help="include finished")
+    s.set_defaults(fn=cmd_council)
 
     s = sub.add_parser("config", help="show/set hub url, token, machine name")
     s.add_argument("--url")

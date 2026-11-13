@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import hmac
 import json
 import os
@@ -9,41 +11,68 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from .store import Conflict, NotFound, Store
+from .store import Conflict, Forbidden, NotFound, Store
 
-DEFAULT_DB = Path(os.environ.get("MMI_DB", Path.home() / ".local/share/memyselfandi/hub.db"))
+DATA_DIR = Path(os.environ.get("MMI_DATA", Path.home() / ".local/share/memyselfandi"))
+DEFAULT_DB = Path(os.environ.get("MMI_DB", DATA_DIR / "hub.db"))
+MAX_WAIT_S = 240  # keep long-polls under typical MCP client tool timeouts
 
 INSTRUCTIONS = """\
-memyselfandi is the shared coordination hub for all of the user's agents across their machines
-(desktop PC, laptop, ...). Other agents may be working in parallel on other computers.
+memyselfandi coordinates all of the user's agents across their machines. Each project has an ORGANIZER
+agent that owns the plan and the project's memory (the ledger). You talk to it by queueing tickets, and it
+answers in order (first come, first served). That's how you find out what to work on and pick up where
+another agent (maybe on another computer) left off.
 
-Protocol:
-1. At the start of a session call `register` once (name, machine, kind, project). Keep the returned
-   agent id and pass it as `agent_id` to every other call. Reuse an id you were given before if you have one.
-2. Call `get_board` to see who else is active, what they're doing, and the open tasks.
-3. Before starting work that someone else might also pick up, `claim_task` it. Claims are atomic;
-   if it fails, someone else has it, so pick something else.
-4. Call `heartbeat` with a one-line status whenever your focus changes (at least every ~10 minutes
-   while active), and `update_task` with notes/status as you make progress. Mark tasks done.
-5. Check `read_inbox` between steps; other agents and the user send requests and handoffs there.
-6. To hand work to another machine/agent, `create_task` (optionally target_machine or assignee)
-   and/or `send_message`.
+Worker protocol:
+1. `register` once (name, machine, kind, project). Keep the returned id and pass it as agent_id everywhere.
+   If you were given an agent id before, reuse it. `list_projects` shows project names.
+2. Check in: `ask_organizer(kind="checkin", body="who you are, what you see in the repo, what you're
+   ready for")`, then `wait_for_reply(ticket_id)`. The reply is your briefing and assignment.
+3. Work the assignment. Use `heartbeat` with a one-line status when your focus changes, and `update_task`
+   for progress notes.
+4. Questions: `ask_organizer(kind="question", blocking=...)`.
+   - If the answer is the ONLY thing that unblocks you, set blocking=true and `wait_for_reply`
+     (it returns after a few minutes at most, so call it again while status is queued/with_organizer/delegated).
+   - If there's independent work you can do meanwhile, set blocking=false, keep working, and check back
+     with `check_ticket` between steps. Stop and wait only when the answer is all that's left.
+5. Done, stuck, or ending your session: `ask_organizer(kind="report" or "handoff")` with what you did,
+   what's left, and where things are (paths, branches, task ids), so the next agent can continue.
+6. Check `read_inbox` occasionally for direct messages.
 """
 
 
 def build_server(store: Store) -> MCPServer:
-    mcp = MCPServer("memyselfandi", instructions=INSTRUCTIONS, version="0.1.0")
+    mcp = MCPServer("memyselfandi", instructions=INSTRUCTIONS, version="0.2.0")
     tools: dict[str, Any] = {}
 
     def tool(fn):
+        """Register fn as an MCP tool (and for the CLI). Domain errors reach the agent with their message;
+        otherwise mcp 2.x would report only 'Error executing tool X'."""
         tools[fn.__name__] = fn
-        return mcp.tool()(fn)
+        expected = (NotFound, Forbidden, Conflict, ValueError)
 
-    # -- agents --------------------------------------------------------------
+        if asyncio.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def wrapped(*a, **kw):
+                try:
+                    return await fn(*a, **kw)
+                except expected as e:
+                    raise ToolError(str(e)) from e
+        else:
+            @functools.wraps(fn)
+            def wrapped(*a, **kw):
+                try:
+                    return fn(*a, **kw)
+                except expected as e:
+                    raise ToolError(str(e)) from e
+        return mcp.tool()(wrapped)
+
+    # ======================= everyone =========================================
     @tool
     def register(
         name: str,
@@ -55,26 +84,33 @@ def build_server(store: Store) -> MCPServer:
     ) -> dict[str, Any]:
         """Register this agent with the hub (or re-register an existing agent_id). Returns your agent record;
         keep `id` and pass it as agent_id to other tools. kind: claude-code | codex | human | other.
-        project: repo or directory you're working in. status: one line on what you're doing."""
+        project: the memyselfandi project name you're working on. status: one line on what you're doing."""
+        if kind in ("organizer", "council"):
+            raise Forbidden("organizer/council identities are assigned by the hub")
         return store.register(name, machine, kind, project, status, agent_id)
 
     @tool
     def heartbeat(agent_id: str, status: str | None = None) -> dict[str, Any]:
-        """Mark yourself alive and optionally update your one-line status. Also reports unread message count."""
+        """Mark yourself alive and optionally update your one-line status. Reports unread message count."""
         agent = store.heartbeat(agent_id, status)
         agent["unread_messages"] = len(store.inbox(agent_id, mark_read=False))
         return agent
 
     @tool
+    def list_projects() -> list[dict[str, Any]]:
+        """Projects that have an organizer, with queue depth."""
+        return store.list_projects()
+
+    @tool
     def list_agents(include_offline: bool = False) -> list[dict[str, Any]]:
-        """List agents across all machines with their status, online flag, and active task ids."""
+        """Agents across all machines with their status, online flag, and active task ids."""
         return store.list_agents(include_offline)
 
     @tool
     def get_board(agent_id: str | None = None) -> dict[str, Any]:
-        """One-call overview: online agents, open/active tasks, and (if agent_id given) your unread messages
-        (without marking them read)."""
+        """Overview: projects + queue depth, online agents, open tasks, and (if agent_id) your unread messages."""
         board: dict[str, Any] = {
+            "projects": store.list_projects(),
             "agents": store.list_agents(include_offline=False),
             "tasks": store.list_tasks(),
         }
@@ -82,7 +118,119 @@ def build_server(store: Store) -> MCPServer:
             board["unread_messages"] = store.inbox(agent_id, mark_read=False)
         return board
 
-    # -- tasks ---------------------------------------------------------------
+    @tool
+    def get_ledger(project: str) -> dict[str, Any]:
+        """The project's living summary (state, decisions, who's on what) plus recent log entries."""
+        return store.get_ledger(project)
+
+    # ======================= workers: talking to the organizer ================
+    @tool
+    def ask_organizer(
+        agent_id: str,
+        project: str,
+        body: str,
+        kind: str = "question",
+        blocking: bool = False,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Queue a ticket for the project's organizer. kind: checkin | question | report | handoff.
+        blocking=true means you can't make ANY progress until it's answered. Returns the ticket with your
+        position in line; then use wait_for_reply / check_ticket."""
+        if kind == "council_report":
+            raise Forbidden("council_report is for council members")
+        store.heartbeat(agent_id)
+        return store.enqueue(project, agent_id, body, kind, blocking, task_id)
+
+    @tool
+    def check_ticket(ticket_id: str) -> dict[str, Any]:
+        """Non-blocking: current status, position in line, and the reply if answered."""
+        return store.get_ticket(ticket_id)
+
+    @tool
+    async def wait_for_reply(ticket_id: str, timeout_s: int = MAX_WAIT_S) -> dict[str, Any]:
+        """Wait (up to ~4 minutes) for the organizer's reply. If it comes back still queued, with_organizer,
+        or delegated, call again. Use this only when the answer is the only thing unblocking you."""
+        deadline = asyncio.get_running_loop().time() + max(1, min(timeout_s, MAX_WAIT_S))
+        while True:
+            t = store.get_ticket(ticket_id)
+            if t["status"] in ("answered", "cancelled") or asyncio.get_running_loop().time() >= deadline:
+                return t
+            await asyncio.sleep(1)
+
+    @tool
+    def cancel_ticket(agent_id: str, ticket_id: str) -> dict[str, Any]:
+        """Withdraw a ticket you no longer need answered."""
+        return store.cancel_ticket(ticket_id, agent_id)
+
+    # ======================= organizer =======================================
+    @tool
+    def organizer_next(agent_id: str, project: str) -> dict[str, Any]:
+        """ORGANIZER ONLY. Take the next ticket in line. Returns {ticket, ledger, queue_depth, active_council,
+        open_tasks}; ticket is null when the queue is empty (then stop and wait to be woken)."""
+        ticket = store.next_ticket(project, agent_id)
+        queued = [t for t in store.list_tickets(project) if t["status"] == "queued"]
+        out: dict[str, Any] = {"ticket": ticket, "queue_depth": len(queued)}
+        if ticket:
+            asker = store.get_agent(ticket["asker"])
+            ticket["asker_info"] = {k: asker[k] for k in ("name", "kind", "machine", "status", "online")}
+            out["ledger"] = store.get_ledger(project, log_limit=15)
+            out["active_council"] = store.list_council(project)
+            out["open_tasks"] = store.list_tasks(project=project)
+        return out
+
+    @tool
+    def answer_ticket(agent_id: str, ticket_id: str, reply: str) -> dict[str, Any]:
+        """ORGANIZER or the COUNCIL MEMBER it was delegated to. Answer a ticket; the asker gets `reply`.
+        Make it self-contained (context, paths, task ids, definition of done)."""
+        return store.answer_ticket(ticket_id, agent_id, reply)
+
+    @tool
+    def update_ledger(
+        agent_id: str, project: str, summary: str | None = None, entry: str | None = None, kind: str = "note"
+    ) -> dict[str, Any]:
+        """ORGANIZER (or council). `summary` REPLACES the living project summary (rewrite it, don't append).
+        `entry` appends to the log; kind: note | decision | handoff."""
+        agent = store.get_agent(agent_id)
+        if agent["kind"] not in ("organizer", "council") or agent["project"] != project:
+            raise Forbidden("only this project's organizer/council can edit its ledger")
+        if summary is not None and agent["kind"] != "organizer":
+            raise Forbidden("only the organizer rewrites the summary; council members add entries")
+        return store.update_ledger(project, agent_id, summary, entry, kind)
+
+    @tool
+    def summon_council(
+        agent_id: str,
+        project: str,
+        role: str,
+        tier: str,
+        brief: str,
+        justification: str = "",
+        ticket_id: str | None = None,
+    ) -> dict[str, Any]:
+        """ORGANIZER ONLY. Summon a temporary council member. tier: routine (Sonnet) | senior (Opus 5) |
+        elder (Fable; only for extreme, ground-breaking changes). senior/elder need a justification.
+        Pass ticket_id to delegate a ticket you're holding; the member answers it and reports back to you."""
+        return store.summon_council(project, agent_id, role, tier, brief, justification, ticket_id)
+
+    @tool
+    def list_council(project: str, include_finished: bool = False) -> list[dict[str, Any]]:
+        """Council members on a project (active only by default)."""
+        return store.list_council(project, active_only=not include_finished)
+
+    @tool
+    def list_queue(project: str) -> list[dict[str, Any]]:
+        """Open tickets for a project in queue order (queued, with_organizer, delegated)."""
+        return store.list_tickets(project)
+
+    # ======================= council ==========================================
+    @tool
+    def council_report(agent_id: str, report: str) -> dict[str, Any]:
+        """COUNCIL ONLY. Final report to the organizer (decisions, answers given, tasks created, risks).
+        Ends your session; you'll be dismissed shortly after."""
+        store.get_council(agent_id)
+        return store.council_report(agent_id, report)
+
+    # ======================= tasks + messages ==================================
     @tool
     def create_task(
         title: str,
@@ -93,8 +241,8 @@ def build_server(store: Store) -> MCPServer:
         assignee: str | None = None,
         target_machine: str | None = None,
     ) -> dict[str, Any]:
-        """Create a shared task. priority 0=urgent..3=low. Set assignee (agent id) to hand it to a specific
-        agent, or target_machine so only agents on that machine pick it up. agent_id = you (the creator)."""
+        """Create a task. priority 0=urgent..3=low. assignee = agent id to hand it to; target_machine limits
+        who should pick it up. agent_id = you (the creator)."""
         return store.create_task(title, description, project, priority, agent_id, assignee, target_machine)
 
     @tool
@@ -109,12 +257,12 @@ def build_server(store: Store) -> MCPServer:
 
     @tool
     def get_task(task_id: str) -> dict[str, Any]:
-        """Get one task including its full note history."""
+        """One task with its full note history."""
         return store.get_task(task_id)
 
     @tool
     def claim_task(task_id: str, agent_id: str) -> dict[str, Any]:
-        """Atomically claim an open task for yourself. Errors if another agent already has it."""
+        """Atomically claim an open task (only when the organizer told you to pick from open tasks)."""
         return store.claim_task(task_id, agent_id)
 
     @tool
@@ -129,21 +277,21 @@ def build_server(store: Store) -> MCPServer:
         priority: int | None = None,
     ) -> dict[str, Any]:
         """Update a task and/or append a progress note. status: open (releases it) | claimed | in_progress |
-        blocked | done | cancelled. Leave a note when finishing or blocking so other agents have context."""
+        blocked | done | cancelled."""
         return store.update_task(task_id, agent_id, status, note, assignee, title, description, priority)
 
-    # -- messages ------------------------------------------------------------
     @tool
     def send_message(agent_id: str | None, to: str, body: str) -> dict[str, Any]:
-        """Send a message to another agent (their agent id) or '*' to broadcast to everyone."""
+        """Direct message to another agent id, or '*' to broadcast. For anything about what to work on, go
+        through ask_organizer instead."""
         return store.send_message(agent_id, to, body)
 
     @tool
     def read_inbox(agent_id: str, include_read: bool = False) -> list[dict[str, Any]]:
-        """Read messages sent to you (and broadcasts). Marks them read."""
+        """Messages sent to you (and broadcasts). Marks them read."""
         return store.inbox(agent_id, unread_only=not include_read)
 
-    # -- plain HTTP ----------------------------------------------------------
+    # ======================= plain HTTP ========================================
     @mcp.custom_route("/health", methods=["GET"])
     async def health(_: Request) -> Response:
         return JSONResponse({"ok": True})
@@ -161,13 +309,32 @@ def build_server(store: Store) -> MCPServer:
         try:
             args = await request.json() if await request.body() else {}
             result = fn(**args)
+            if asyncio.iscoroutine(result):
+                result = await result
         except NotFound as e:
             return JSONResponse({"error": str(e)}, status_code=404)
+        except Forbidden as e:
+            return JSONResponse({"error": str(e)}, status_code=403)
         except Conflict as e:
             return JSONResponse({"error": str(e)}, status_code=409)
         except (TypeError, ValueError) as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         return Response(json.dumps(result, default=str), media_type="application/json")
+
+    # Admin-only (CLI) operations that agents shouldn't have as MCP tools.
+    @mcp.custom_route("/api/admin/{op}", methods=["POST"])
+    async def admin(request: Request) -> Response:
+        args = await request.json() if await request.body() else {}
+        ops = {
+            "add_project": lambda: store.add_project(**args),
+            "remove_agent": lambda: store.remove_agent(**args) or {"ok": True},
+        }
+        if request.path_params["op"] not in ops:
+            return JSONResponse({"error": "no such op"}, status_code=404)
+        try:
+            return Response(json.dumps(ops[request.path_params["op"]](), default=str), media_type="application/json")
+        except (NotFound, TypeError, ValueError) as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
 
     return mcp
 
@@ -196,11 +363,25 @@ def build_app(store: Store, host: str, token: str | None):
     return TokenAuth(app, token) if token else app
 
 
-def serve(host: str, port: int, db: Path, token: str | None) -> None:
+def serve(host: str, port: int, db: Path, token: str | None, supervise: bool = True,
+          tiers: dict[str, str] | None = None) -> None:
+    import logging
+    import shutil
+
     import uvicorn
 
-    store = Store(db)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    store = Store(db, tiers=tiers)
     if host not in ("127.0.0.1", "localhost", "::1") and not token:
-        print("warning: listening beyond localhost without MMI_TOKEN; anyone on that network can use the hub")
+        print("warning: listening beyond localhost without a token; anyone on that network can use the hub")
+    if supervise:
+        if shutil.which("tmux") is None:
+            print("warning: tmux not found; organizers/council won't be launched (use --no-supervise to silence)")
+        else:
+            from .supervisor import Supervisor
+
+            local_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+            Supervisor(store, f"http://{local_host}:{port}", token, DATA_DIR / "run").start()
+            print("supervisor: organizers and council run in tmux session 'mmi' (`mmi attach`)")
     print(f"memyselfandi hub on http://{host}:{port}/mcp  (db: {db})")
     uvicorn.run(build_app(store, host, token), host=host, port=port, log_level="warning")

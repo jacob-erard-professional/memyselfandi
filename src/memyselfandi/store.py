@@ -18,6 +18,15 @@ from typing import Any
 STALE_AFTER_S = 15 * 60
 
 TASK_STATUSES = ("open", "claimed", "in_progress", "blocked", "done", "cancelled")
+TICKET_KINDS = ("checkin", "question", "report", "handoff", "council_report")
+
+# Council tiers -> model. Overridable via hub config ("tiers": {...}).
+DEFAULT_TIERS = {
+    "routine": "claude-sonnet-5-5",  # routing, lookups, summaries, simple breakdowns
+    "senior": "claude-opus-5",       # real design/debugging/planning within or across areas
+    "elder": "claude-fable-5-2",     # only extreme, ground-breaking changes
+}
+ORGANIZER_MODEL = "claude-opus-5-5"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -62,7 +71,62 @@ CREATE TABLE IF NOT EXISTS reads (
     message_id  INTEGER NOT NULL,
     PRIMARY KEY (agent_id, message_id)
 );
+CREATE TABLE IF NOT EXISTS projects (
+    name        TEXT PRIMARY KEY,
+    path        TEXT NOT NULL,          -- repo path on the hub machine (organizer/council read code here)
+    description TEXT NOT NULL DEFAULT '',
+    organizers  INTEGER NOT NULL DEFAULT 1,
+    created_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ledger (
+    project     TEXT PRIMARY KEY REFERENCES projects(name),
+    summary     TEXT NOT NULL DEFAULT '',  -- organizer-maintained "state of the project"
+    updated_by  TEXT,
+    updated_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ledger_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project     TEXT NOT NULL,
+    author      TEXT,
+    kind        TEXT NOT NULL DEFAULT 'note',  -- note | decision | handoff | council
+    body        TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tickets (
+    id          TEXT PRIMARY KEY,
+    project     TEXT NOT NULL REFERENCES projects(name),
+    asker       TEXT NOT NULL,           -- agent id
+    kind        TEXT NOT NULL,           -- checkin | question | report | handoff | council_report
+    body        TEXT NOT NULL,
+    blocking    INTEGER NOT NULL DEFAULT 0,  -- asker can't make any progress until answered
+    task_id     TEXT,
+    lane        INTEGER NOT NULL DEFAULT 1,  -- 0 = council reports (front of line), 1 = everyone else
+    status      TEXT NOT NULL DEFAULT 'queued', -- queued | with_organizer | delegated | answered | cancelled
+    handler     TEXT,                    -- organizer or council id currently holding it
+    reply       TEXT,
+    answered_by TEXT,
+    created_at  REAL NOT NULL,
+    picked_at   REAL,
+    answered_at REAL
+);
+CREATE TABLE IF NOT EXISTS council (
+    id          TEXT PRIMARY KEY,
+    project     TEXT NOT NULL REFERENCES projects(name),
+    role        TEXT NOT NULL,
+    tier        TEXT NOT NULL,           -- routine | senior | elder
+    model       TEXT NOT NULL,
+    brief       TEXT NOT NULL,
+    justification TEXT NOT NULL DEFAULT '',
+    ticket_id   TEXT,
+    summoned_by TEXT,
+    status      TEXT NOT NULL DEFAULT 'pending', -- pending | running | done | failed
+    report      TEXT,
+    created_at  REAL NOT NULL,
+    started_at  REAL,
+    finished_at REAL
+);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tickets_queue ON tickets(project, status, lane, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient);
 """
 
@@ -79,8 +143,13 @@ class Conflict(RuntimeError):
     pass
 
 
+class Forbidden(PermissionError):
+    pass
+
+
 class Store:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, tiers: dict[str, str] | None = None):
+        self.tiers = {**DEFAULT_TIERS, **(tiers or {})}
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -296,6 +365,226 @@ class Store:
             for m in rows:
                 self._x("INSERT OR IGNORE INTO reads (agent_id, message_id) VALUES (?, ?)", (agent_id, m["id"]))
         return rows
+
+    # -- projects ----------------------------------------------------------
+    def add_project(self, name: str, path: str, description: str = "", organizers: int = 1) -> dict[str, Any]:
+        now = time.time()
+        self._x(
+            """INSERT INTO projects (name, path, description, organizers, created_at) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET path=excluded.path, description=excluded.description,
+                   organizers=excluded.organizers""",
+            (name, path, description, organizers, now),
+        )
+        self._x("INSERT OR IGNORE INTO ledger (project, summary, updated_at) VALUES (?, '', ?)", (name, now))
+        return self.get_project(name)
+
+    def get_project(self, name: str) -> dict[str, Any]:
+        rows = self._q("SELECT * FROM projects WHERE name=?", (name,))
+        if not rows:
+            raise NotFound(f"unknown project {name!r}; the user needs to run `mmi project add {name} --path ...`")
+        return rows[0]
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        projects = self._q("SELECT * FROM projects ORDER BY name")
+        for p in projects:
+            p["queued"] = self._q(
+                "SELECT COUNT(*) n FROM tickets WHERE project=? AND status='queued'", (p["name"],)
+            )[0]["n"]
+        return projects
+
+    # -- ledger ------------------------------------------------------------
+    def get_ledger(self, project: str, log_limit: int = 30) -> dict[str, Any]:
+        self.get_project(project)
+        led = self._q("SELECT * FROM ledger WHERE project=?", (project,))[0]
+        led["log"] = list(reversed(self._q(
+            "SELECT author, kind, body, created_at FROM ledger_log WHERE project=? ORDER BY id DESC LIMIT ?",
+            (project, log_limit),
+        )))
+        return led
+
+    def update_ledger(
+        self, project: str, author: str | None, summary: str | None = None, entry: str | None = None,
+        kind: str = "note",
+    ) -> dict[str, Any]:
+        self.get_project(project)
+        now = time.time()
+        if summary is not None:
+            self._x("UPDATE ledger SET summary=?, updated_by=?, updated_at=? WHERE project=?",
+                    (summary, author, now, project))
+        if entry:
+            self._x("INSERT INTO ledger_log (project, author, kind, body, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (project, author, kind, entry, now))
+        return self.get_ledger(project, log_limit=5)
+
+    # -- tickets (the organizer's queue) --------------------------------------
+    def _require_kind(self, agent_id: str, kind: str, project: str | None = None) -> dict[str, Any]:
+        agent = self.get_agent(agent_id)
+        if agent["kind"] != kind or (project and agent["project"] != project):
+            raise Forbidden(f"{agent_id} is not the {kind} for {project or 'this project'}")
+        return agent
+
+    def _position(self, ticket: dict[str, Any]) -> int | None:
+        if ticket["status"] != "queued":
+            return None
+        return self._q(
+            """SELECT COUNT(*) n FROM tickets WHERE project=? AND status='queued'
+               AND (lane < ? OR (lane = ? AND created_at < ?))""",
+            (ticket["project"], ticket["lane"], ticket["lane"], ticket["created_at"]),
+        )[0]["n"] + 1
+
+    def enqueue(
+        self, project: str, asker: str, body: str, kind: str = "question", blocking: bool = False,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.get_project(project)
+        self.get_agent(asker)
+        if kind not in TICKET_KINDS:
+            raise ValueError(f"kind must be one of {TICKET_KINDS}")
+        lane = 0 if kind == "council_report" else 1
+        tid = _short_id("q")
+        self._x(
+            """INSERT INTO tickets (id, project, asker, kind, body, blocking, task_id, lane, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (tid, project, asker, kind, body, int(blocking), task_id, lane, time.time()),
+        )
+        return self.get_ticket(tid)
+
+    def get_ticket(self, ticket_id: str) -> dict[str, Any]:
+        rows = self._q("SELECT * FROM tickets WHERE id=?", (ticket_id,))
+        if not rows:
+            raise NotFound(f"unknown ticket {ticket_id!r}")
+        t = rows[0]
+        t["blocking"] = bool(t["blocking"])
+        t["position"] = self._position(t)
+        return t
+
+    def list_tickets(self, project: str | None = None, open_only: bool = True) -> list[dict[str, Any]]:
+        sql, args = "SELECT id FROM tickets WHERE 1=1", []
+        if project:
+            sql += " AND project=?"
+            args.append(project)
+        if open_only:
+            sql += " AND status IN ('queued','with_organizer','delegated')"
+        sql += " ORDER BY lane, created_at"
+        return [self.get_ticket(r["id"]) for r in self._q(sql, tuple(args))]
+
+    def next_ticket(self, project: str, organizer_id: str) -> dict[str, Any] | None:
+        """Organizer takes the next ticket in line. Atomic, so several organizers can share a queue."""
+        self._require_kind(organizer_id, "organizer", project)
+        while True:
+            rows = self._q(
+                "SELECT id FROM tickets WHERE project=? AND status='queued' ORDER BY lane, created_at LIMIT 1",
+                (project,),
+            )
+            if not rows:
+                return None
+            cur = self._x(
+                "UPDATE tickets SET status='with_organizer', handler=?, picked_at=? WHERE id=? AND status='queued'",
+                (organizer_id, time.time(), rows[0]["id"]),
+            )
+            if cur.rowcount:
+                return self.get_ticket(rows[0]["id"])
+
+    def held_by(self, handler: str) -> list[dict[str, Any]]:
+        return [self.get_ticket(r["id"]) for r in self._q(
+            "SELECT id FROM tickets WHERE handler=? AND status IN ('with_organizer','delegated') ORDER BY picked_at",
+            (handler,),
+        )]
+
+    def answer_ticket(self, ticket_id: str, by: str, reply: str) -> dict[str, Any]:
+        t = self.get_ticket(ticket_id)
+        agent = self.get_agent(by)
+        is_handler = t["handler"] == by
+        is_project_organizer = agent["kind"] == "organizer" and agent["project"] == t["project"]
+        if t["status"] not in ("with_organizer", "delegated") or not (is_handler or is_project_organizer):
+            raise Forbidden(f"{by} can't answer {ticket_id} (status {t['status']}, handler {t['handler']})")
+        self._x(
+            "UPDATE tickets SET status='answered', reply=?, answered_by=?, answered_at=? WHERE id=?",
+            (reply, by, time.time(), ticket_id),
+        )
+        return self.get_ticket(ticket_id)
+
+    def requeue_ticket(self, ticket_id: str) -> dict[str, Any]:
+        """Put a held ticket back in line (e.g. its organizer died)."""
+        self._x("UPDATE tickets SET status='queued', handler=NULL, picked_at=NULL WHERE id=? "
+                "AND status IN ('with_organizer','delegated')", (ticket_id,))
+        return self.get_ticket(ticket_id)
+
+    def cancel_ticket(self, ticket_id: str, by: str) -> dict[str, Any]:
+        t = self.get_ticket(ticket_id)
+        if t["asker"] != by:
+            raise Forbidden("only the asker can cancel a ticket")
+        self._x("UPDATE tickets SET status='cancelled' WHERE id=? AND status!='answered'", (ticket_id,))
+        return self.get_ticket(ticket_id)
+
+    # -- council -----------------------------------------------------------
+    def summon_council(
+        self, project: str, organizer_id: str, role: str, tier: str, brief: str,
+        justification: str = "", ticket_id: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_kind(organizer_id, "organizer", project)
+        if tier not in self.tiers:
+            raise ValueError(f"tier must be one of {tuple(self.tiers)}")
+        if tier != "routine" and len(justification.strip()) < 20:
+            raise ValueError(f"a {tier} council member needs a real justification (why a cheaper tier won't do)")
+        if tier == "elder":
+            busy = self._q("SELECT id FROM council WHERE project=? AND tier='elder' AND status IN ('pending','running')",
+                           (project,))
+            if busy:
+                raise Conflict(f"an elder is already sitting on this project ({busy[0]['id']}); wait for its report")
+        if ticket_id:
+            t = self.get_ticket(ticket_id)
+            if t["project"] != project or t["status"] != "with_organizer":
+                raise Conflict(f"ticket {ticket_id} isn't currently held by an organizer of {project}")
+        cid = _short_id("cn")
+        now = time.time()
+        self._x(
+            """INSERT INTO council (id, project, role, tier, model, brief, justification, ticket_id, summoned_by,
+                                    created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (cid, project, role, tier, self.tiers[tier], brief, justification, ticket_id, organizer_id, now),
+        )
+        self.register(f"council:{role}", "hub", "council", project=project, status=f"{tier} - {role}", agent_id=cid)
+        if ticket_id:
+            self._x("UPDATE tickets SET status='delegated', handler=? WHERE id=?", (cid, ticket_id))
+        self.update_ledger(project, organizer_id, entry=f"summoned {tier} council '{role}' ({cid}): {brief[:300]}"
+                           + (f" | why: {justification[:300]}" if justification else ""), kind="council")
+        return self.get_council(cid)
+
+    def get_council(self, council_id: str) -> dict[str, Any]:
+        rows = self._q("SELECT * FROM council WHERE id=?", (council_id,))
+        if not rows:
+            raise NotFound(f"unknown council member {council_id!r}")
+        return rows[0]
+
+    def list_council(self, project: str | None = None, active_only: bool = True) -> list[dict[str, Any]]:
+        sql, args = "SELECT * FROM council WHERE 1=1", []
+        if project:
+            sql += " AND project=?"
+            args.append(project)
+        if active_only:
+            sql += " AND status IN ('pending','running')"
+        return self._q(sql + " ORDER BY created_at", tuple(args))
+
+    def set_council_status(self, council_id: str, status: str) -> dict[str, Any]:
+        col = {"running": "started_at", "done": "finished_at", "failed": "finished_at"}.get(status)
+        sets = f"status=?{', ' + col + '=?' if col else ''}"
+        self._x(f"UPDATE council SET {sets} WHERE id=?", (status, time.time(), council_id) if col else (status, council_id))
+        return self.get_council(council_id)
+
+    def council_report(self, council_id: str, report: str) -> dict[str, Any]:
+        c = self.get_council(council_id)
+        if c["status"] in ("done", "failed"):
+            raise Conflict(f"{council_id} already reported")
+        self._x("UPDATE council SET status='done', report=?, finished_at=? WHERE id=?",
+                (report, time.time(), council_id))
+        # A delegated ticket the council member never answered goes back to the organizer.
+        if c["ticket_id"]:
+            t = self.get_ticket(c["ticket_id"])
+            if t["status"] == "delegated" and t["handler"] == council_id:
+                self.requeue_ticket(t["id"])
+        self.update_ledger(c["project"], council_id, entry=f"council '{c['role']}' reported: {report[:500]}",
+                           kind="council")
+        return self.enqueue(c["project"], council_id, report, kind="council_report", task_id=c["ticket_id"])
 
     # -- overview ----------------------------------------------------------
     def snapshot(self) -> dict[str, Any]:

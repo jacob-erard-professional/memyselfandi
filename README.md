@@ -1,85 +1,112 @@
 # memyselfandi
 
-A shared hub so your agents (Claude Code, Codex, ...) on every machine you own can see each other,
-split up tasks, and message each other. Your PC agents and laptop agents always work from the same
-live list of agents, tasks, and messages.
+One organizer per project that every agent on every machine reports to. Workers (Claude Code, Codex,
+on your PC or laptop) queue up to talk to it, get briefed with exactly where the last agent left off,
+and get their next assignment. The organizer can summon a council of specialists to take work off its
+plate, and they hand work back out.
+
+```
+ workers (PC, laptop, any session)                 desktop PC: the hub (`mmi up`)
+ ┌──────────────────────┐   MCP over tailscale   ┌──────────────────────────────────────────────┐
+ │ Claude Code / Codex  │ ── ask_organizer ────► │ queue (per project): first come first served │
+ │  "done with X, next?"│ ◄─ wait_for_reply ──── │   council reports go to the front            │
+ └──────────────────────┘                        │                                              │
+                                                 │ ORGANIZER  (Opus 5.5, tmux window)           │
+ you: `mmi status / ask / ledger / attach`       │   ledger = project memory/continuity         │
+                                                 │   briefs, assigns tasks, delegates           │
+                                                 │        │ summon_council(tier, brief)           │
+                                                 │        ▼                                     │
+                                                 │ COUNCIL (temporary, own tmux windows)        │
+                                                 │   routine = Sonnet 5.5   (routing, lookups)  │
+                                                 │   senior  = Opus 5       (design, debugging) │
+                                                 │   elder   = Fable 5.2    (extreme changes)   │
+                                                 └──────────────────────────────────────────────┘
+```
 
 ## How it works
 
-```
-  laptop                                   desktop PC (always on)
-  ┌───────────────┐                        ┌──────────────────────────┐
-  │ Claude Code ──┼──┐                     │  mmi serve  (the hub)    │
-  │ Codex       ──┼──┤   MCP over HTTP     │   ├─ /mcp   MCP tools    │
-  │ mmi (you)   ──┼──┼──── tailscale ─────►│   ├─ /api   JSON for CLI │
-  └───────────────┘  │                     │   └─ SQLite: agents,     │
-                     │   ┌──────────────┐  │      tasks, messages     │
-                     └───┤ PC agents    ├─►│                          │
-                         └──────────────┘  └──────────────────────────┘
-```
+- **Projects** are registered on the hub with a repo path (`mmi project add`). Each gets 1+ organizers.
+- **Workers** connect to the hub as an MCP server. Its built-in instructions tell them the protocol:
+  1. `register`
+  2. `ask_organizer(kind="checkin")` and wait for the reply, which is the briefing plus an assignment
+  3. Work.
+     - **Questions:** `ask_organizer(kind="question", blocking=…)`.
+     - **Blocking:** if the answer is the *only* thing that unblocks them, they `wait_for_reply`.
+     - **Non-blocking:** otherwise they keep doing independent work and `check_ticket` later.
+  4. `report` or `handoff` with what's done and what's left, so the next agent (on any machine) continues
+     from there.
+- **The organizer** is a Claude Code session (Opus 5.5) in tmux. It runs with read-only tools plus the
+  hub's tools. It doesn't write code; it decides, briefs, assigns tasks, and keeps the **ledger**: a
+  living project summary plus a log of decisions and handoffs. It's woken only when its queue has
+  something in it, so an idle organizer costs nothing.
+- **Council members** are summoned by the organizer per its charter
+  (`src/memyselfandi/prompts/organizer.md`). The organizer picks the cheapest tier that will do the job:
+  - **Routine / senior / elder:** the tier decides the model.
+  - **Justification:** senior and elder require a written justification.
+  - **One elder:** only one elder can sit per project at a time.
+  - **Logged:** every summons goes to the ledger.
 
-- **One hub** owns the state (one SQLite file), so there's nothing to merge or sync and no conflicts.
-- **Agents talk to it as an MCP server.** It ships instructions telling them to register, look at the
-  board, claim tasks before working on them, heartbeat their status, and check their inbox.
-- **Task claims are atomic.** Two agents can't both grab the same task.
-- **`mmi` is you.** From any terminal you can see the board, add or assign tasks, and message agents.
-- **Transport is your Tailscale tailnet**, plus a shared bearer token.
-
-### MCP tools
-
-| tool | purpose |
-|---|---|
-| `register` / `heartbeat` | announce yourself (name, machine, kind, project) and keep a one-line status |
-| `get_board` | online agents + open tasks + your unread messages in one call |
-| `list_agents` | who's where, doing what, holding which tasks |
-| `create_task` / `list_tasks` / `get_task` | shared task list, with priority, project, `target_machine`, `assignee` |
-| `claim_task` / `update_task` | atomic claim; status + progress notes (`open` releases a task) |
-| `send_message` / `read_inbox` | direct messages to an agent id, or `*` to broadcast |
+  A member can answer the ticket it was delegated directly and create tasks. It finishes with
+  `council_report`, which jumps the queue back to the organizer. Then its window is closed.
+- **The supervisor** (inside the hub) keeps organizer windows alive. When a window dies, the supervisor
+  puts any ticket it held back in line. It also launches and dismisses council members: they fail after
+  exiting without a report or after 90 minutes.
 
 ## Setup
 
-### 1. Hub (desktop PC)
+### Hub (desktop PC)
 
 ```bash
 cd ~/projects/memyselfandi && uv sync
-uv run mmi config --new-hub-token          # generates a token, stored in ~/.config/memyselfandi/config.json
-uv run mmi serve --host 0.0.0.0            # or install deploy/memyselfandi-hub.service
-uv run mmi mcp-setup --apply               # connects this machine's Claude Code to the hub
+uv run mmi config --new-hub-token            # token in ~/.config/memyselfandi/config.json
+uv run mmi up                                # hub + supervisor in tmux session "mmi"
+uv run mmi project add myapp --path ~/projects/myapp -d "what this project is"
+uv run mmi attach org-myapp-1                # first time per repo: accept Claude Code's folder-trust prompt
+uv run mmi mcp-setup --apply                 # point this machine's own Claude Code at the hub
 ```
 
-### 2. Every other machine (laptop, ...)
+Optional `~/.config/memyselfandi/config.json` keys:
+- `"tiers": {"routine": "...", "senior": "...", "elder": "..."}` overrides the council models.
+- `MMI_NOTIFY_CMD` (env) is run with a message when an elder is summoned or a session is stuck on the
+  trust prompt. Example: `MMI_NOTIFY_CMD=slack-notify`.
+
+For an always-on hub, see `deploy/memyselfandi-hub.service`. It runs `mmi serve`, and the supervisor still
+creates the `mmi` tmux session for the agents.
+
+### Every other machine (laptop, ...)
 
 ```bash
-git clone <this repo> && cd memyselfandi && uv sync   # or: uv tool install .
-uv run mmi config --url http://jacob-erard-desktop:7377 --token <token from `mmi config --show-token` on the PC>
-uv run mmi mcp-setup --apply               # Claude Code; it also prints the Codex config.toml block
-uv run mmi status
+git clone <this repo> && cd memyselfandi && uv sync
+uv run mmi config --url http://jacob-erard-desktop:7377 --token <`mmi config --show-token` on the PC>
+uv run mmi mcp-setup --apply                 # Claude Code; also prints the Codex config.toml block
 ```
 
-For Codex, add the printed block to `~/.codex/config.toml` and `export MMI_TOKEN=<token>`.
+Then start any agent in a project and tell it: *"check in with the memyselfandi organizer for myapp"*.
 
-### 3. Day to day
+### Day to day
 
 ```bash
-mmi status                                   # who's online, what's open
-mmi add "Port auth tests to pytest" -p api --machine laptop
-mmi send ag-1a2b3c4d "rebase on main before you push"
-mmi send '*' "freezing main for release"
-mmi tasks -a ; mmi show t-9f8e7d6c ; mmi done t-9f8e7d6c -n "merged"
-mmi inbox
+mmi status                     # projects + queue depth, online agents, open tasks
+mmi ledger myapp               # where the project stands
+mmi queue myapp                # who's waiting in line
+mmi council myapp -a           # who's been summoned, at what tier
+mmi ask myapp -w "prioritize the auth bug over the UI work"   # you can queue tickets too
+mmi attach                     # watch the organizer/council sessions (tmux)
 ```
 
 ## Development
 
-```bash
-uv run pytest
-```
+`uv run pytest`. The e2e test drives a real hub over MCP in every role. Supervisor tests use a fake tmux.
 
-Layout: `src/memyselfandi/store.py` (state and rules), `hub.py` (MCP server and HTTP), `cli.py` (`mmi`).
+- `store.py`: state and rules (queue, ledger, council, tasks)
+- `hub.py`: MCP tools and the HTTP API
+- `supervisor.py`: tmux sessions
+- `cli.py`: the `mmi` command
+- `prompts/`: the organizer and council charters
 
-## Roadmap ideas
+## Roadmap
 
-- Hooks that auto-register Claude Code sessions and surface inbox messages without the agent asking
-- Push notifications (MCP resource subscriptions / SSE) instead of polling the inbox
-- Offline mode: laptop queues writes when the hub is unreachable and replays them later
-- Shared artifacts/context (handoff notes, file pointers, branch names), plus a small web dashboard
+- Hooks so Claude Code sessions auto-register and check in on start, and hand off on exit
+- Recycle long-running organizer sessions (fresh context, rebuilt from the ledger)
+- Offline mode for the laptop when the hub is unreachable
+- Small web dashboard for the ledger and queue

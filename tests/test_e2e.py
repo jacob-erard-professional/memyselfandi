@@ -1,12 +1,12 @@
-"""Spin up a real hub with a token and drive it via MCP (as an agent would) and via the CLI."""
+"""Spin up a real hub (no tmux) and play every role over real MCP: worker, organizer, council, human CLI."""
 
 import asyncio
-import json
 import os
 import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 import httpx2
@@ -25,7 +25,7 @@ def hub(tmp_path):
     env = {**os.environ, "MMI_TOKEN": TOKEN, "MMI_CONFIG": str(tmp_path / "cfg.json")}
     proc = subprocess.Popen(
         [sys.executable, "-m", "memyselfandi.cli", "serve", "--host", "0.0.0.0", "--port", str(port),
-         "--db", str(tmp_path / "hub.db")],
+         "--db", str(tmp_path / "hub.db"), "--no-supervise"],
         env=env,
     )
     url = f"http://127.0.0.1:{port}"
@@ -40,23 +40,34 @@ def hub(tmp_path):
     proc.wait()
 
 
-def mcp_call(url, calls):
-    async def run():
-        out = []
-        async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"}) as http:
-            async with Client(streamable_http_client(url + "/mcp", http_client=http)) as c:
-                names = {t.name for t in (await c.list_tools()).tools}
-                assert {"register", "claim_task", "send_message", "get_board"} <= names
-                for name, args in calls:
-                    r = await c.call_tool(name, args)
-                    out.append((r.is_error, r.structured_content, r.content))
-        return out
+class Agent:
+    """One MCP session, like a Claude Code / Codex agent would hold."""
 
-    return asyncio.run(run())
+    def __init__(self, url):
+        self.url = url
+
+    async def __aenter__(self):
+        self.http = httpx2.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"})
+        self.client = Client(streamable_http_client(self.url + "/mcp", http_client=self.http))
+        await self.client.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.client.__aexit__(*exc)
+        await self.http.aclose()
+
+    async def __call__(self, tool, **args):
+        r = await self.client.call_tool(tool, args)
+        if r.is_error:
+            raise RuntimeError(r.content[0].text if r.content else "tool error")
+        sc = r.structured_content
+        return sc.get("result", sc) if isinstance(sc, dict) and set(sc) == {"result"} else sc
 
 
 def mmi(env, *args):
-    return subprocess.run([sys.executable, "-m", "memyselfandi.cli", *args], env=env, capture_output=True, text=True)
+    r = subprocess.run([sys.executable, "-m", "memyselfandi.cli", *args], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
 
 
 def test_unauthorized_rejected(hub):
@@ -67,36 +78,65 @@ def test_unauthorized_rejected(hub):
     assert e.value.code == 401
 
 
-def test_agent_over_mcp_and_human_over_cli(hub):
+def test_worker_organizer_council_flow(hub, tmp_path):
     url, env = hub
-    # an agent on the desktop registers and creates a task
-    (_, reg, _), (_, task, _) = mcp_call(url, [
-        ("register", {"name": "builder", "machine": "desktop", "kind": "claude-code", "project": "api",
-                      "agent_id": "ag-desk1"}),
-        ("create_task", {"title": "write migration", "agent_id": "ag-desk1", "target_machine": "laptop"}),
-    ])
-    assert reg["id"] == "ag-desk1"
-    task_id = task["id"]
+    mmi(env, "project", "add", "app", "--path", str(tmp_path), "-d", "demo app")
+    # Without tmux the supervisor is off; register the organizer identity the way it would.
+    req = urllib.request.Request(
+        url + "/api/admin/add_project", method="POST",
+        data=b'{"name": "app", "path": "/tmp", "description": "demo app"}',
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
+    urllib.request.urlopen(req)
 
-    # the human on the laptop sees it, messages the agent
-    r = mmi(env, "status")
-    assert r.returncode == 0, r.stderr
-    assert "builder" in r.stdout and "write migration" in r.stdout
-    assert mmi(env, "send", "ag-desk1", "please", "pick", "up", task_id).returncode == 0
+    async def run():
+        from memyselfandi.store import Store
+        Store(tmp_path / "hub.db").register("organizer #1", "hub", "organizer", project="app",
+                                            agent_id="org-app-1")
+        async with Agent(url) as worker, Agent(url) as org, Agent(url) as council:
+            # worker on the laptop checks in and waits in line
+            w = (await worker("register", name="laptop-claude", machine="laptop", project="app"))["id"]
+            with pytest.raises(RuntimeError, match="assigned by the hub"):
+                await worker("register", name="sneaky", machine="x", kind="organizer")
+            t = await worker("ask_organizer", agent_id=w, project="app", kind="checkin",
+                             body="ready for work", blocking=True)
+            assert t["position"] == 1
+            waiting = asyncio.create_task(worker("wait_for_reply", ticket_id=t["id"], timeout_s=20))
 
-    # a codex agent on the laptop claims it; the desktop agent can't steal it
-    results = mcp_call(url, [
-        ("register", {"name": "laptop-codex", "machine": "laptop", "kind": "codex", "agent_id": "ag-lap1"}),
-        ("claim_task", {"task_id": task_id, "agent_id": "ag-lap1"}),
-        ("claim_task", {"task_id": task_id, "agent_id": "ag-desk1"}),
-        ("read_inbox", {"agent_id": "ag-desk1"}),
-    ])
-    assert results[1][1]["assignee"] == "ag-lap1"
-    assert results[2][0] is True  # conflict surfaced as a tool error
-    inbox = results[3][1]
-    inbox = inbox.get("result", inbox) if isinstance(inbox, dict) else inbox
-    assert "please pick up" in json.dumps(inbox)
+            # organizer takes it, briefs, assigns a task
+            nxt = await org("organizer_next", agent_id="org-app-1", project="app")
+            assert nxt["ticket"]["id"] == t["id"] and nxt["ticket"]["asker_info"]["machine"] == "laptop"
+            task = await org("create_task", title="add login form", agent_id="org-app-1", project="app",
+                             assignee=w)
+            await org("answer_ticket", agent_id="org-app-1", ticket_id=t["id"],
+                      reply=f"Do {task['id']}: add the login form.")
+            await org("update_ledger", agent_id="org-app-1", project="app",
+                      summary="Login form in progress (laptop-claude).", entry="assigned login form",
+                      kind="decision")
+            got = await waiting
+            assert got["status"] == "answered" and task["id"] in got["reply"]
 
-    assert mmi(env, "done", task_id, "-n", "merged").returncode == 0
-    assert "write migration" not in mmi(env, "tasks").stdout
-    assert "merged" in mmi(env, "show", task_id).stdout
+            # a non-blocking question gets delegated to a routine council member
+            q = await worker("ask_organizer", agent_id=w, project="app", body="which CSS lib?")
+            nxt = await org("organizer_next", agent_id="org-app-1", project="app")
+            c = await org("summon_council", agent_id="org-app-1", project="app", role="frontend",
+                          tier="routine", brief="pick a CSS lib", ticket_id=q["id"])
+            assert c["model"] == "claude-sonnet-5-5"
+            assert (await worker("check_ticket", ticket_id=q["id"]))["status"] == "delegated"
+            await council("answer_ticket", agent_id=c["id"], ticket_id=q["id"], reply="use the existing one")
+            rep = await council("council_report", agent_id=c["id"], report="answered CSS question")
+            assert rep["kind"] == "council_report"
+            assert (await worker("check_ticket", ticket_id=q["id"]))["reply"] == "use the existing one"
+            nxt = await org("organizer_next", agent_id="org-app-1", project="app")
+            assert nxt["ticket"]["kind"] == "council_report"
+            await org("answer_ticket", agent_id="org-app-1", ticket_id=nxt["ticket"]["id"], reply="ack")
+            with pytest.raises(RuntimeError, match="can't answer"):  # reasons reach the agent
+                await worker("answer_ticket", agent_id=w, ticket_id=q["id"], reply="x")
+            assert (await org("organizer_next", agent_id="org-app-1", project="app"))["ticket"] is None
+
+    asyncio.run(run())
+
+    # the human sees it all from the CLI
+    assert "Login form in progress" in mmi(env, "ledger", "app")
+    assert "app" in mmi(env, "status")
+    assert "frontend" in mmi(env, "council", "app", "-a")
+    assert "(queue empty)" in mmi(env, "queue", "app")

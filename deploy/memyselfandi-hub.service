@@ -11,6 +11,7 @@ WorkingDirectory=%h/projects/memyselfandi
 # Bind to all interfaces; the token (from `mmi config --new-hub-token`) gates access.
 # To restrict to the tailnet, use --host <your tailscale IP> instead.
 ExecStart=%h/.local/bin/uv run mmi serve --host 0.0.0.0
+Environment=PATH=%h/.local/bin:%h/.nvm/versions/node/v25.9.0/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 
 [Install]
