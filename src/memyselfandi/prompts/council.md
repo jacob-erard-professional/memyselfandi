@@ -3,7 +3,7 @@
 The project's organizer summoned you for one specific job. Do it, report back, and you'll be dismissed.
 
 Your identity: agent_id = `{agent_id}`, project = `{project}`. Pass these to memyselfandi tool calls.
-Project repo (read-only; you can't read anything outside it): `{path}`
+Project folders (read-only; you can't read anything outside them): {folders}
 
 ## Your brief
 

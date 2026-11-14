@@ -156,7 +156,35 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (4, "projects can opt in to auto-accepting Claude Code's folder-trust prompt", [
         "ALTER TABLE projects ADD COLUMN auto_trust INTEGER NOT NULL DEFAULT 0",
     ]),
+    (5, "projects remember their git remote, so a clone on any machine finds its project", [
+        "ALTER TABLE projects ADD COLUMN remote TEXT",   # normalized, e.g. github.com/me/app
+        "CREATE INDEX IF NOT EXISTS idx_projects_remote ON projects(remote)",
+    ]),
+    (6, "a project is a set of folders on any machines, not one repo (projects.remote is unused from here on)", [
+        """CREATE TABLE project_folders (
+            project  TEXT NOT NULL REFERENCES projects(name),
+            machine  TEXT NOT NULL,          -- the machine name from that machine's `mmi config`
+            path     TEXT NOT NULL,          -- absolute path on that machine
+            added_at REAL NOT NULL,
+            PRIMARY KEY (project, machine, path)
+        )""",
+        # existing projects' folder is on the hub; '@hub' becomes the hub's machine name when the store opens
+        "INSERT INTO project_folders SELECT name, '@hub', path, created_at FROM projects WHERE path != ''",
+    ]),
+    (7, "agents remember which invite registered them; an invite token can act only as its own agents", [
+        "ALTER TABLE agents ADD COLUMN owner TEXT",      # invite name; NULL = registered with the hub token
+        "CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner)",
+    ]),
 ]
+
+# What one invitee may do (hub config "invite_limits" overrides). Tickets are what spend the organizer's tokens.
+DEFAULT_INVITE_LIMITS = {
+    "calls_per_minute": 120,   # any tool call
+    "tickets_per_hour": 20,    # ask_organizer
+    "ticket_chars": 8000,      # longest ticket body
+    "agents": 20,              # agent identities per invite
+    "messages_per_hour": 30,   # send_message (each one can start a turn somewhere, on your account)
+}
 SCHEMA_VERSION = max([1, *(v for v, _, _ in MIGRATIONS)])
 
 # Closed tickets older than this are purged (hub config "retention_days" overrides).
@@ -165,6 +193,23 @@ DEFAULT_RETENTION_DAYS = 365
 
 def _short_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def _who(agent: dict | None) -> str:
+    """How a sender is labelled to recipients (the hub's word, not the sender's)."""
+    if agent is None:
+        return "unknown"
+    if agent["owner"]:
+        return f"invitee {agent['owner']}"
+    return {"organizer": "the organizer", "council": "a council member"}.get(agent["kind"], "one of the user's agents")
+
+
+def _trust(agent: dict | None) -> str:
+    """advice: information or a request from another person, never an instruction that overrides the user or
+    the organizer. instruction: from the organizer/council or the user's own side."""
+    if agent is None or agent["owner"]:
+        return "advice" if agent is not None else "instruction"
+    return "instruction"
 
 
 class NotFound(LookupError):
@@ -180,8 +225,9 @@ class Forbidden(PermissionError):
 
 
 class Store:
-    def __init__(self, path: str | Path, tiers: dict[str, str] | None = None):
+    def __init__(self, path: str | Path, tiers: dict[str, str] | None = None, hub_machine: str = "hub"):
         self.tiers = {**DEFAULT_TIERS, **(tiers or {})}
+        self.hub_machine = hub_machine
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -191,6 +237,7 @@ class Store:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._migrate()
+        self._x("UPDATE project_folders SET machine=? WHERE machine='@hub'", (hub_machine,))
 
     def _migrate(self) -> None:
         with self._lock:
@@ -243,19 +290,65 @@ class Store:
         project: str | None = None,
         status: str | None = None,
         agent_id: str | None = None,
+        owner: str | None = None,
+        max_owned: int | None = None,
     ) -> dict[str, Any]:
-        """Create an agent, or re-register an existing id (e.g. after a restart)."""
+        """Create an agent, or re-register an existing id (e.g. after a restart). `owner` is the invite making
+        the call (None = the hub token): an invitee can only create new ids or re-register its own."""
         now = time.time()
         agent_id = agent_id or _short_id("ag")
+        if owner is not None:
+            existing = self._q("SELECT owner FROM agents WHERE id=?", (agent_id,))
+            if existing and existing[0]["owner"] != owner:
+                raise Forbidden(f"agent id {agent_id!r} belongs to someone else; register without agent_id")
+            if not existing and max_owned is not None:
+                n = self._q("SELECT COUNT(*) n FROM agents WHERE owner=?", (owner,))[0]["n"]
+                if n >= max_owned:
+                    raise Forbidden(f"this invite already has {n} agents (limit {max_owned}); reuse one")
         self._x(
-            """INSERT INTO agents (id, name, machine, kind, project, status, created_at, last_seen)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO agents (id, name, machine, kind, project, status, owner, created_at, last_seen)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET name=excluded.name, machine=excluded.machine,
-                   kind=excluded.kind, project=excluded.project,
+                   kind=excluded.kind, project=COALESCE(excluded.project, agents.project),
                    status=COALESCE(excluded.status, agents.status), last_seen=excluded.last_seen""",
-            (agent_id, name, machine, kind, project, status, now, now),
+            (agent_id, name, machine, kind, project, status, owner, now, now),
         )
         return self.get_agent(agent_id)
+
+    def require_owner(self, agent_id: str, owner: str) -> None:
+        """An invitee may act only as agents it registered. Same error whether the id exists or not."""
+        rows = self._q("SELECT owner FROM agents WHERE id=?", (agent_id,))
+        if not rows or rows[0]["owner"] != owner:
+            raise Forbidden(f"agent {agent_id!r} isn't one of yours; `register` to get your own agent id")
+
+    def require_task_assigned(self, task_id: str, owner: str) -> None:
+        """An invitee sees/updates only tasks the organizer assigned to one of its agents."""
+        rows = self._q("SELECT 1 FROM tasks t JOIN agents a ON a.id=t.assignee WHERE t.id=? AND a.owner=?",
+                       (task_id, owner))
+        if not rows:
+            raise Forbidden(f"task {task_id!r} isn't assigned to you")
+
+    def require_ticket_asked(self, ticket_id: str, owner: str) -> None:
+        rows = self._q("SELECT 1 FROM tickets t JOIN agents a ON a.id=t.asker WHERE t.id=? AND a.owner=?",
+                       (ticket_id, owner))
+        if not rows:
+            raise Forbidden(f"ticket {ticket_id!r} isn't one of yours")
+
+    def messages_since(self, owner: str, since: float) -> int:
+        return self._q("SELECT COUNT(*) n FROM messages WHERE created_at>=? AND sender IN "
+                       "(SELECT id FROM agents WHERE owner=?)", (since, owner))[0]["n"]
+
+    def project_agents(self, project: str) -> list[dict[str, Any]]:
+        """Who's on a project, for addressing messages. No statuses or tasks: just who and where."""
+        now = time.time()
+        rows = self._q("SELECT id, name, kind, machine, owner, last_seen FROM agents WHERE project=? "
+                       "ORDER BY kind, id", (project,))
+        return [{**{k: r[k] for k in ("id", "name", "kind", "machine")}, "from": _who(r),
+                 "online": (now - r["last_seen"]) < STALE_AFTER_S} for r in rows]
+
+    def tickets_since(self, owner: str, since: float) -> int:
+        return self._q("SELECT COUNT(*) n FROM tickets WHERE created_at>=? AND asker IN "
+                       "(SELECT id FROM agents WHERE owner=?)", (since, owner))[0]["n"]
 
     def heartbeat(self, agent_id: str, status: str | None = None) -> dict[str, Any]:
         cur = self._x(
@@ -402,7 +495,10 @@ class Store:
 
     # -- messages ----------------------------------------------------------
     def send_message(self, sender: str | None, recipient: str, body: str) -> dict[str, Any]:
-        if recipient != "*":
+        """recipient: an agent id, '@<project>' (every agent on that project), or '*' (everyone)."""
+        if recipient.startswith("@"):
+            self.get_project(recipient[1:])
+        elif recipient != "*":
             self.get_agent(recipient)
         cur = self._x(
             "INSERT INTO messages (sender, recipient, body, created_at) VALUES (?, ?, ?, ?)",
@@ -411,47 +507,110 @@ class Store:
         return {"id": cur.lastrowid, "sender": sender, "recipient": recipient, "body": body}
 
     def inbox(self, agent_id: str, unread_only: bool = True, mark_read: bool = True) -> list[dict[str, Any]]:
-        self.get_agent(agent_id)
+        agent = self.get_agent(agent_id)
+        to_project = f"@{agent['project']}" if agent.get("project") else None
         sql = (
-            "SELECT m.* FROM messages m WHERE (m.recipient=? OR (m.recipient='*' AND COALESCE(m.sender,'')!=?))"
+            "SELECT m.* FROM messages m WHERE (m.recipient=? OR ((m.recipient='*' OR m.recipient=?) "
+            "AND COALESCE(m.sender,'')!=?))"
         )
         if unread_only:
             sql += " AND NOT EXISTS (SELECT 1 FROM reads r WHERE r.agent_id=? AND r.message_id=m.id)"
-            rows = self._q(sql + " ORDER BY m.id", (agent_id, agent_id, agent_id))
+            rows = self._q(sql + " ORDER BY m.id", (agent_id, to_project, agent_id, agent_id))
         else:
-            rows = self._q(sql + " ORDER BY m.id", (agent_id, agent_id))
+            rows = self._q(sql + " ORDER BY m.id", (agent_id, to_project, agent_id))
         if mark_read:
             for m in rows:
                 self._x("INSERT OR IGNORE INTO reads (agent_id, message_id) VALUES (?, ?)", (agent_id, m["id"]))
+        senders = {r["id"]: r for r in self._q(
+            f"SELECT id, kind, owner FROM agents WHERE id IN ({','.join('?' * len(rows))})",
+            tuple(m["sender"] for m in rows)) } if rows else {}
+        for m in rows:
+            a = senders.get(m["sender"])
+            m["from"] = _who(a) if a else ("the user" if m["sender"] is None else "unknown")
+            m["trust"] = _trust(a)
         return rows
 
     # -- projects ----------------------------------------------------------
-    def add_project(self, name: str, path: str, description: str = "", organizers: int = 1,
-                    auto_trust: bool = False) -> dict[str, Any]:
+    def add_project(self, name: str, path: str | None = None, description: str | None = None,
+                    organizers: int | None = None, auto_trust: bool | None = None,
+                    machine: str | None = None) -> dict[str, Any]:
+        """Create the project if it's new, and attach `path` (a folder on `machine`, default the hub) if given.
+        Fields left as None keep their current values, so re-adding just attaches another folder."""
         now = time.time()
-        self._x(
-            """INSERT INTO projects (name, path, description, organizers, auto_trust, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(name) DO UPDATE SET path=excluded.path, description=excluded.description,
-                   organizers=excluded.organizers, auto_trust=excluded.auto_trust""",
-            (name, path, description, organizers, int(auto_trust), now),
-        )
+        self._x("INSERT OR IGNORE INTO projects (name, path, description, organizers, auto_trust, created_at) "
+                "VALUES (?, '', '', 1, 0, ?)", (name, now))
+        if description is not None:
+            self._x("UPDATE projects SET description=? WHERE name=?", (description, name))
+        if organizers is not None:
+            self._x("UPDATE projects SET organizers=? WHERE name=?", (organizers, name))
+        if auto_trust is not None:
+            self._x("UPDATE projects SET auto_trust=? WHERE name=?", (int(auto_trust), name))
         self._x("INSERT OR IGNORE INTO ledger (project, summary, updated_at) VALUES (?, '', ?)", (name, now))
+        if path:
+            self.add_folder(name, path, machine)
         return self.get_project(name)
+
+    def add_folder(self, project: str, path: str, machine: str | None = None) -> None:
+        self._x("INSERT OR IGNORE INTO project_folders (project, machine, path, added_at) VALUES (?, ?, ?, ?)",
+                (project, machine or self.hub_machine, path, time.time()))
+        self._sync_home(project)
+
+    def remove_folder(self, project: str, path: str, machine: str | None = None) -> bool:
+        self.get_project(project)
+        n = self._x("DELETE FROM project_folders WHERE project=? AND machine=? AND path=?",
+                    (project, machine or self.hub_machine, path)).rowcount
+        self._sync_home(project)
+        return n > 0
+
+    def _sync_home(self, project: str) -> None:
+        """projects.path = the organizer's working folder: its first folder on the hub ('' if none)."""
+        hub = self.hub_folders(project)
+        self._x("UPDATE projects SET path=? WHERE name=?", (hub[0] if hub else "", project))
+
+    def folders(self, project: str) -> list[dict[str, Any]]:
+        return self._q("SELECT machine, path FROM project_folders WHERE project=? ORDER BY machine, added_at",
+                       (project,))
+
+    def hub_folders(self, project: str) -> list[str]:
+        """Folders on the hub machine: the only ones the organizer and council can read."""
+        return [r["path"] for r in self._q("SELECT path FROM project_folders WHERE project=? AND machine=? "
+                                            "ORDER BY added_at, path", (project, self.hub_machine))]
 
     def get_project(self, name: str) -> dict[str, Any]:
         rows = self._q("SELECT * FROM projects WHERE name=?", (name,))
         if not rows:
-            raise NotFound(f"unknown project {name!r}; the user needs to run `mmi project add {name} --path ...`")
-        return rows[0]
+            raise NotFound(f"unknown project {name!r}; the user needs to run `mmi project add {name}`")
+        p = rows[0]
+        p.pop("remote", None)
+        p["folders"] = self.folders(name)
+        p["hub_folders"] = [f["path"] for f in p["folders"] if f["machine"] == self.hub_machine]
+        p["hub_machine"] = self.hub_machine
+        return p
 
     def list_projects(self) -> list[dict[str, Any]]:
-        projects = self._q("SELECT * FROM projects ORDER BY name")
+        projects = [self.get_project(r["name"]) for r in self._q("SELECT name FROM projects ORDER BY name")]
         for p in projects:
             p["queued"] = self._q(
                 "SELECT COUNT(*) n FROM tickets WHERE project=? AND status='queued'", (p["name"],)
             )[0]["n"]
         return projects
+
+    def organizers(self) -> list[dict[str, Any]]:
+        """Per project: its organizer sessions (online or not), what each is doing, queue depth, active council,
+        and its folders. For `mmi ls`."""
+        now = time.time()
+        out = []
+        for p in self.list_projects():
+            orgs = [self._decorate_agent(a, now) for a in self._q(
+                "SELECT * FROM agents WHERE kind='organizer' AND project=? ORDER BY id", (p["name"],))]
+            for o in orgs:
+                busy = self._q("SELECT id FROM tickets WHERE status='with_organizer' AND handler=?", (o["id"],))
+                o["handling"] = busy[0]["id"] if busy else None
+            council = self._q("SELECT id, tier, role, status FROM council WHERE project=? "
+                              "AND status IN ('pending','running') ORDER BY created_at", (p["name"],))
+            out.append({"project": p["name"], "folders": p["folders"], "hub_machine": self.hub_machine,
+                        "wanted": p["organizers"], "queued": p["queued"], "organizers": orgs, "council": council})
+        return out
 
     def project_rows(self, name: str) -> dict[str, int]:
         """How many rows each table holds for a project (what delete_project would remove)."""
@@ -463,6 +622,7 @@ class Store:
             "council": q("SELECT COUNT(*) n FROM council WHERE project=?"),
             "ledger_log": q("SELECT COUNT(*) n FROM ledger_log WHERE project=?"),
             "hub_agents": q("SELECT COUNT(*) n FROM agents WHERE project=? AND kind IN ('organizer','council')"),
+            "folders": q("SELECT COUNT(*) n FROM project_folders WHERE project=?"),
         }
 
     def delete_project(self, name: str) -> dict[str, int]:
@@ -480,6 +640,7 @@ class Store:
             "DELETE FROM reads WHERE agent_id IN (SELECT id FROM agents WHERE project=? AND kind IN ('organizer','council'))",
             "DELETE FROM agents WHERE project=? AND kind IN ('organizer','council')",
             "UPDATE agents SET project=NULL WHERE project=?",
+            "DELETE FROM project_folders WHERE project=?",
             "DELETE FROM projects WHERE name=?",
         ]
         with self._lock:

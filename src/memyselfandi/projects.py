@@ -25,7 +25,7 @@ def _normalize(url: str) -> str:
 
 def _origin(path: Path) -> str | None:
     r = subprocess.run(["git", "-C", str(path), "remote", "get-url", "origin"], capture_output=True, text=True)
-    return r.stdout.strip() if r.returncode == 0 else None
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
 
 def _clone(git_url: str, target: Path) -> None:
@@ -42,26 +42,44 @@ def _clone(git_url: str, target: Path) -> None:
 
 
 def provision_project(
-    store: Store, name: str, projects_root: str | Path, path: str | None = None, git_url: str | None = None,
-    description: str = "", organizers: int = 1, trust: bool = False,
+    store: Store, name: str, projects_root: str | Path, folders: list[str] | None = None,
+    machine: str | None = None, git_url: str | None = None, description: str | None = None,
+    organizers: int | None = None, trust: bool | None = None,
 ) -> dict[str, Any]:
+    """Create project `name` (if new) and attach folders to it. A project is a set of folders on any of your
+    machines; git plays no part in it. Folders on the hub must exist here (the organizer reads them); folders on
+    other machines are checked by that machine's CLI. `git_url` optionally clones a copy onto the hub too."""
     if not NAME_RE.match(name or ""):
         raise ValueError("project name must be letters, digits, '.', '_' or '-' (max 64), starting with a letter/digit")
-    action = "using"
-    if path and Path(path).expanduser().is_dir():
-        repo = Path(path).expanduser().resolve()
-    elif git_url:
+    machine = machine or store.hub_machine
+    on_hub = machine == store.hub_machine
+    attach: list[tuple[str, str]] = []
+    for f in folders or []:
+        if on_hub:
+            d = Path(f).expanduser()
+            if not d.is_dir():
+                raise ValueError(f"{f} doesn't exist on the hub ({store.hub_machine})")
+            f = str(d.resolve())
+        attach.append((machine, f))
+    cloned = None
+    if git_url:
         repo = (Path(projects_root).expanduser() / name).resolve()
         if repo.exists():
             existing = _origin(repo)
             if not existing or _normalize(existing) != _normalize(git_url):
-                raise ValueError(f"{repo} already exists on the hub and isn't a clone of {git_url}; pass --path")
+                raise ValueError(f"{repo} already exists on the hub and isn't a clone of {git_url}")
         else:
             _clone(git_url, repo)
-            action = "cloned"
-    else:
-        where = f"{path} doesn't exist on the hub" if path else "no path given"
-        raise ValueError(f"{where}. Run this inside a git repo with an 'origin' remote (the hub clones it), "
-                         "or pass --path to a folder on the hub machine.")
-    project = store.add_project(name, str(repo), description, organizers, auto_trust=trust)
-    return {**project, "action": action, "source": git_url if action == "cloned" else None}
+            cloned = str(repo)
+        attach.append((store.hub_machine, str(repo)))
+    project = store.add_project(name, description=description, organizers=organizers, auto_trust=trust)
+    for m, f in attach:
+        store.add_folder(name, f, m)
+    return {**store.get_project(name), "attached": [{"machine": m, "path": f} for m, f in attach],
+            "cloned": cloned}
+
+
+def remove_folders(store: Store, name: str, folders: list[str], machine: str | None = None) -> dict[str, Any]:
+    machine = machine or store.hub_machine
+    removed = [f for f in folders if store.remove_folder(name, f, machine)]
+    return {**store.get_project(name), "removed": removed}

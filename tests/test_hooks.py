@@ -6,19 +6,26 @@ import pytest
 from memyselfandi import claude_hooks
 from memyselfandi.claude_hooks import connect, resolve_project
 
-PROJECTS = [{"name": "myapp", "path": "/srv/hub/myapp"}, {"name": "api", "path": "/srv/hub/api"}]
+PROJECTS = [
+    {"name": "myapp", "folders": [{"machine": "pc", "path": "/srv/hub/myapp"}]},
+    {"name": "api", "folders": [{"machine": "pc", "path": "/srv/hub/api"}]},
+    {"name": "wellwatch", "folders": [{"machine": "pc", "path": "/home/me/WellWatch"},
+                                      {"machine": "mac", "path": "/Users/me/code/ww"},
+                                      {"machine": "mac", "path": "/Users/me/notes/wellwatch"}]},
+    {"name": "ww-ui", "folders": [{"machine": "mac", "path": "/Users/me/code/ww/ui"}]},
+]
 
 
-def test_resolve_project(tmp_path):
-    assert resolve_project("/srv/hub/myapp/src", PROJECTS, {}) == "myapp"          # on the hub machine
-    repo = tmp_path / "code" / "api"
-    (repo / "pkg").mkdir(parents=True)
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    assert resolve_project(str(repo / "pkg"), PROJECTS, {}) == "api"               # clone with same name
-    other = tmp_path / "work" / "my-app-checkout"
-    other.mkdir(parents=True)
-    assert resolve_project(str(other), PROJECTS, {}) is None
-    assert resolve_project(str(other), PROJECTS, {str(tmp_path / "work"): "myapp"}) == "myapp"  # mapping
+def test_resolve_project_by_folder_on_this_machine():
+    assert resolve_project("/srv/hub/myapp/src", PROJECTS, "pc") == "myapp"
+    assert resolve_project("/srv/hub/myapp", PROJECTS, "pc") == "myapp"
+    assert resolve_project("/srv/hub/myapp-old", PROJECTS, "pc") is None          # prefix isn't containment
+    assert resolve_project("/srv/hub/myapp/src", PROJECTS, "mac") is None         # that folder is on the pc
+    assert resolve_project("/home/me/WellWatch/work/ui", PROJECTS, "pc") == "wellwatch"
+    assert resolve_project("/Users/me/notes/wellwatch/x", PROJECTS, "mac") == "wellwatch"  # any folder of it
+    assert resolve_project("/Users/me/code/ww/ui/src", PROJECTS, "mac") == "ww-ui"  # deepest folder wins
+    assert resolve_project("/Users/me/code/ww/api", PROJECTS, "mac") == "wellwatch"
+    assert resolve_project("/tmp/api", PROJECTS, "pc") is None                     # names never match
 
 
 def fake_call():
@@ -32,8 +39,8 @@ def fake_call():
 
 def test_connect_registers_and_returns_protocol():
     call, calls = fake_call()
-    info = connect({"machine": "laptop"}, call, "/srv/hub/api/x")
-    assert info["project"] == "api" and info["agent_id"].startswith("cc-laptop-")
+    info = connect({"machine": "pc"}, call, "/srv/hub/api/x")
+    assert info["project"] == "api" and info["agent_id"].startswith("cc-pc-")
     assert f'agent_id="{info["agent_id"]}"' in info["instructions"] and "checkin" in info["instructions"]
     assert calls[-1][0] == "register"
     assert connect({"machine": "laptop"}, call, "/elsewhere", project="myapp")["project"] == "myapp"

@@ -51,5 +51,11 @@ def test_invite_tokens_against_live_hub(hub):  # noqa: F811
 
 
 def test_sessions_can_only_read_their_project(tmp_path):
-    assert session_tools(str(tmp_path)) == f"mcp__memyselfandi,Read(/{tmp_path.resolve()}/**)"
-    assert ",Read," not in session_tools(str(tmp_path)) + ","  # never a bare Read
+    assert session_tools([str(tmp_path)]) == f"mcp__memyselfandi,Read(/{tmp_path.resolve()}/**)"
+    assert ",Read," not in session_tools([str(tmp_path)]) + ","  # never a bare Read
+    assert session_tools([]) == "mcp__memyselfandi"                 # no hub folders: no Read at all
+    two = session_tools([str(tmp_path / "a"), str(tmp_path / "b")])
+    assert two.count("Read(") == 2
+    for bad in (str(tmp_path), ["/"], [""]):                       # a bare string, the root, empty
+        with pytest.raises((TypeError, ValueError)):
+            session_tools(bad)

@@ -80,17 +80,21 @@ class FakeRunner:
         self.sent: list[tuple[str, str]] = []
         self.screens: dict[str, str] = {}
         self.pressed: list = []
+        self.cwds: dict[str, str] = {}
+        self.killed: list[str] = []
 
     def has_window(self, name):
         return name in self.windows
 
     def launch(self, name, cwd, argv):
         self.windows[name] = argv
+        self.cwds[name] = cwd
 
     def send(self, name, text):
         self.sent.append((name, text))
 
     def kill(self, name):
+        self.killed.append(name)
         self.windows.pop(name, None)
 
     def capture(self, name):

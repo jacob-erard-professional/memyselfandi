@@ -80,16 +80,27 @@ uv run mmi config --url http://jacob-erard-desktop:7377 --token <`mmi config --s
 uv run mmi install-claude                    # Claude Code (`mmi mcp-setup` prints the Codex config block)
 ```
 
-### New projects
+### Projects
 
-From inside any git repo, on any of your machines: `mmi project add`. It starts a new organizer for that repo.
-- **Defaults** come from the repo you're in: the name is the folder name, plus the repo root and its `origin` remote.
-- **On the hub PC** it uses the folder where it is.
-- **On another machine** the hub clones `origin` into `~/projects/<name>` on the PC, because organizers read code
-  there. Change the location with `"projects_root"` in the hub config.
-- **`--trust`** means you trust this repo, so the hub accepts Claude Code's folder-trust prompt for it. Without it,
-  the organizer waits until you `mmi attach org-<name>-1` and answer it yourself.
-- **From a session:** `/memyselfandi` offers to do this when the repo isn't registered yet. It asks you first.
+A project is a name plus a set of folders on any of your machines. It isn't tied to a git repo: one project
+can span several repos, worktrees, or plain folders, and one organizer coordinates all of them.
+
+```bash
+mmi project add wellwatch                    # create it (if new) and add the current folder
+mmi project add wellwatch ~/a ~/b            # add more folders on this machine
+mmi project add wellwatch --git <url>        # also clone a copy onto the hub for the organizer to read
+mmi project remove-folder wellwatch ~/b
+mmi project show wellwatch                   # folders on every machine
+mmi ls                                       # organizers: running?, doing what, queue (-f for folders)
+```
+
+- Folders are recorded per machine (the `machine` name in each machine's `mmi config`). A session whose
+  folder is inside one of the project's folders on its machine connects to that project.
+- The organizer can **read** only the project's folders on the hub PC. It's restarted when those change.
+  Folders on other machines are for their sessions; the organizer coordinates them.
+- **`--trust`** means you trust the project's hub folders, so the hub accepts Claude Code's folder-trust prompt.
+  Without it, the organizer waits until you `mmi attach org-<name>-1` and answer it yourself.
+- **From a session:** `/memyselfandi` offers to add the folder to a project when it isn't in one. It asks first.
 
 ### Connecting a session (opt-in)
 
@@ -139,7 +150,7 @@ uv run mmi --profile collab up --host 127.0.0.1                 # tmux session "
 cd deploy/collab && cp .env.example .env                        # paste a Tailscale auth key into .env
 docker compose up -d                                            # "mmi-collab" appears in your tailnet
 uv run mmi --profile collab config --public-url http://<mmi-collab's 100.x IP>:7377
-uv run mmi --profile collab project add shared-thing --path ~/projects/shared-thing
+uv run mmi --profile collab project add shared-thing ~/projects/shared-thing
 ```
 
 **Inviting someone:**

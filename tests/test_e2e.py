@@ -80,11 +80,12 @@ def test_unauthorized_rejected(hub):
 
 def test_worker_organizer_council_flow(hub, tmp_path):
     url, env = hub
-    mmi(env, "project", "add", "app", "--path", str(tmp_path), "-d", "demo app")
+    out = mmi(env, "project", "add", "app", str(tmp_path), "-d", "demo app")
+    assert str(tmp_path) in out
     # Without tmux the supervisor is off; register the organizer identity the way it would.
     req = urllib.request.Request(
         url + "/api/admin/add_project", method="POST",
-        data=b'{"name": "app", "path": "/tmp", "description": "demo app"}',
+        data=b'{"name": "app", "folders": ["/tmp"]}',
         headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
     urllib.request.urlopen(req)
 

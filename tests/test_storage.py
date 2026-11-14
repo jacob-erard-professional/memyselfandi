@@ -19,8 +19,9 @@ def test_migrates_a_pre_migration_database(tmp_path):
     old.commit()
     old.close()
 
-    s = Store(db)
+    s = Store(db, hub_machine="pc")
     assert s.schema_version == SCHEMA_VERSION
+    assert s.get_project("app")["folders"] == [{"machine": "pc", "path": "/tmp"}]  # old path -> hub folder
     assert s.get_ticket("q-done")["closed_at"] == 20 and s.get_ticket("q-done")["closed"]
     assert s.get_ticket("q-open")["closed_at"] is None
     assert [t["id"] for t in s.list_tickets("app")] == ["q-open"]
@@ -98,3 +99,14 @@ def test_supervisor_heartbeats_are_throttled(tmp_path):
     for i in range(1, 30):  # ~90s of ticks
         sup.tick(now=1000 + 3 * i)
     assert s.get_agent("org-app-1")["last_seen"] == seen
+
+
+def test_organizers_overview():
+    s = Store(":memory:")
+    w = setup(s)
+    t = s.enqueue("app", w, "hi")
+    s.next_ticket("app", "org-app-1")
+    rows = {r["project"]: r for r in s.organizers()}
+    assert rows["other"]["organizers"] == [] and rows["other"]["wanted"] == 1
+    org = rows["app"]["organizers"][0]
+    assert org["id"] == "org-app-1" and org["online"] and org["handling"] == t["id"]

@@ -37,10 +37,34 @@ COUNCIL_MAX_S = 90 * 60     # council members are dismissed after this long
 HEARTBEAT_EVERY_S = 120    # throttle organizer heartbeats: each one is a disk write
 COUNCIL_LINGER_S = 30       # keep a finished council window around briefly so you can glance at it
 
-def session_tools(project_path: str) -> str:
-    """Hub tools + Read limited to the project folder. A bare "Read" lets the session read any file you can
-    (verified), and tickets can come from other people's agents, so never widen this."""
-    return f"mcp__memyselfandi,Read(//{str(Path(project_path).resolve()).lstrip('/')}/**)"
+def session_tools(folders: list[str]) -> str:
+    """Hub tools + Read limited to the project's folders on the hub. A bare "Read" lets the session read any file
+    you can (verified), and tickets can come from other people's agents, so never widen this. No folders: no Read."""
+    if isinstance(folders, (str, Path)):
+        raise TypeError("session_tools takes a list of folders")
+    reads = []
+    for f in folders:
+        resolved = Path(f).resolve()
+        if not str(f).strip() or resolved == Path(resolved.anchor):
+            raise ValueError(f"refusing to grant Read on {f!r}: that's the whole disk")
+        reads.append(f"Read(//{str(resolved).lstrip('/')}/**)")
+    return ",".join(["mcp__memyselfandi", *reads])
+
+
+def _elsewhere(project: dict) -> str:
+    other = [f for f in project.get("folders", []) if f["machine"] != project.get("hub_machine")]
+    if not other:
+        return ""
+    lines = "\n".join(f"- `{f['path']}` on {f['machine']}" for f in other)
+    return ("\nAlso part of this project, on other machines (you can't read these; workers there can, and their "
+            f"sessions connect to you):\n{lines}\n")
+
+
+def folder_list(folders: list[str]) -> str:
+    if not folders:
+        return ("none on this machine yet: you can't read the code. Coordinate from the ledger and workers' "
+                "reports; the user can add a folder on the hub with `mmi project add <project> <path>`.")
+    return "\n" + "\n".join(f"- `{f}`" for f in folders)
 
 
 class Runner(Protocol):
@@ -138,7 +162,7 @@ class Supervisor:
         return path
 
     def _argv(self, agent_id: str, model: str, system_prompt: str, first_message: str, label: str,
-              project_path: str) -> list[str]:
+              folders: list[str]) -> list[str]:
         sp = self.run_dir / f"{window_name(agent_id)}.system.md"
         sp.write_text(system_prompt)
         # Positional prompt first: --allowedTools / --mcp-config are variadic and would swallow it.
@@ -151,7 +175,7 @@ class Supervisor:
             "--permission-mode", "dontAsk",
             "--strict-mcp-config",
             "--append-system-prompt-file", str(sp),
-            "--allowedTools", session_tools(project_path),
+            "--allowedTools", session_tools(folders),
             "--mcp-config", str(self.mcp_config),
         ]
 
@@ -170,7 +194,10 @@ class Supervisor:
         screen = self.runner.capture(win)
         if "trust this folder" in screen:
             try:
-                auto = bool(self.store.get_project(project).get("auto_trust"))
+                p = self.store.get_project(project)
+                # --trust is consent for its folders; with no hub folders the session runs in an empty folder we
+                # made ourselves (nothing in it to trust)
+                auto = bool(p.get("auto_trust")) or not p["hub_folders"]
             except LookupError:
                 auto = False
             if auto:
@@ -199,6 +226,26 @@ class Supervisor:
                 pass
         return True
 
+    # -- folders -------------------------------------------------------------
+    def _home(self, project: dict) -> str:
+        """Where the project's sessions start: its first folder on the hub, else an empty folder of ours."""
+        if project["hub_folders"]:
+            return project["hub_folders"][0]
+        home = self.run_dir / "homes" / project["name"]
+        home.mkdir(parents=True, exist_ok=True)
+        return str(home)
+
+    def _scope_file(self, agent_id: str) -> Path:
+        return self.run_dir / f"{window_name(agent_id)}.folders.json"
+
+    def _scope_changed(self, agent_id: str, project: dict) -> bool:
+        f = self._scope_file(agent_id)
+        current = sorted(project["hub_folders"])
+        if not f.exists():  # launched by an older version: adopt it as-is
+            f.write_text(json.dumps(current))
+            return False
+        return json.loads(f.read_text()) != current
+
     # -- organizers ----------------------------------------------------------
     def _launch_organizer(self, project: dict, agent_id: str, now: float) -> None:
         # Anything the previous incarnation was holding goes back in line.
@@ -206,14 +253,17 @@ class Supervisor:
             if t["status"] == "with_organizer":
                 self.store.requeue_ticket(t["id"])
         desc = f"\nAbout the project: {project['description']}\n" if project["description"] else ""
+        folders = project["hub_folders"]
         system = _template("organizer.md").format(
-            project=project["name"], agent_id=agent_id, path=project["path"], description=desc
+            project=project["name"], agent_id=agent_id, folders=folder_list(folders),
+            elsewhere=_elsewhere(project), description=desc,
         )
         first = (f"You're online as organizer {agent_id} for {project['name']}. "
                  f"Call organizer_next(agent_id='{agent_id}', project='{project['name']}') and work the queue "
                  "until it's empty, then wait.")
-        argv = self._argv(agent_id, ORGANIZER_MODEL, system, first, f"organizer:{project['name']}", project["path"])
-        self.runner.launch(window_name(agent_id), project["path"], argv)
+        argv = self._argv(agent_id, ORGANIZER_MODEL, system, first, f"organizer:{project['name']}", folders)
+        self.runner.launch(window_name(agent_id), self._home(project), argv)
+        self._scope_file(agent_id).write_text(json.dumps(sorted(folders)))
         self.windows[agent_id] = project["name"]
         self.launched_at[agent_id] = self.last_nudge[agent_id] = now
         log.info("launched organizer %s", agent_id)
@@ -232,6 +282,12 @@ class Supervisor:
             self._launch_organizer(project, agent_id, now)
             return
         if self._stuck_on_trust(agent_id, project["name"]):
+            return
+        if self._scope_changed(agent_id, project) and not self.store.held_by(agent_id):
+            # its Read permissions are fixed at launch: restart it (idle, so nothing is lost) with the new folders
+            log.info("folders of %s changed; restarting %s", project["name"], agent_id)
+            self.runner.kill(win)
+            self._launch_organizer(project, agent_id, now)
             return
         if now - self.launched_at.get(agent_id, 0) < STARTUP_GRACE_S:
             return
@@ -260,12 +316,12 @@ class Supervisor:
                 f"{t['body']}\n"
             )
         system = _template("council.md").format(
-            tier=c["tier"], project=c["project"], role=c["role"], agent_id=c["id"], path=project["path"],
-            brief=c["brief"], ticket_section=ticket_section,
+            tier=c["tier"], project=c["project"], role=c["role"], agent_id=c["id"],
+            folders=folder_list(project["hub_folders"]), brief=c["brief"], ticket_section=ticket_section,
         )
         first = f"You're council member {c['id']}. Do your brief now and finish with council_report."
-        argv = self._argv(c["id"], c["model"], system, first, f"council:{c['role']}", project["path"])
-        self.runner.launch(window_name(c["id"]), project["path"], argv)
+        argv = self._argv(c["id"], c["model"], system, first, f"council:{c['role']}", project["hub_folders"])
+        self.runner.launch(window_name(c["id"]), self._home(project), argv)
         self.windows[c["id"]] = c["project"]
         self.store.set_council_status(c["id"], "running")
         if c["tier"] == "elder":

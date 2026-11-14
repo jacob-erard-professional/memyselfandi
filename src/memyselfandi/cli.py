@@ -142,7 +142,8 @@ def cmd_serve(args, cfg):
 
     token = os.environ.get("MMI_TOKEN") or cfg.get("hub_token")
     serve(args.host, args.port or cfg.get("port") or DEFAULT_PORT, Path(args.db or DEFAULT_DB), token, supervise=not args.no_supervise,
-          tiers=cfg.get("tiers"), retention_days=cfg.get("retention_days"), unix_socket=cfg.get("socket"))
+          tiers=cfg.get("tiers"), retention_days=cfg.get("retention_days"), unix_socket=cfg.get("socket"),
+          machine=cfg["machine"], invite_limits=cfg.get("invite_limits"))
 
 
 def cmd_up(args, cfg):
@@ -250,33 +251,57 @@ def cmd_inbox(args, cfg):
     print(fmt_messages(call(cfg, "read_inbox", agent_id=me(cfg), include_read=args.all)))
 
 
-def _git(cwd: str, *args: str) -> str | None:
-    import subprocess
-
-    r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True)
-    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+def _fmt_folders(folders: list[dict], hub_machine: str | None = None, indent: str = "    ") -> str:
+    if not folders:
+        return f"{indent}(no folders)"
+    tag = lambda m: f"{m} (hub)" if m == hub_machine else m  # noqa: E731
+    return "\n".join(f"{indent}{tag(f['machine'])}: {f['path']}" for f in folders)
 
 
 def cmd_project_add(args, cfg):
-    """Defaults come from the git repo you're in: name = folder name, path = repo root (used if it exists on the
-    hub, i.e. you're on the hub machine), git = its origin remote (the hub clones it if the path isn't there)."""
-    root = _git(os.getcwd(), "rev-parse", "--show-toplevel")
-    path = str(Path(args.path).expanduser().resolve()) if args.path else root
-    git_url = args.git or (_git(root, "remote", "get-url", "origin") if root else None)
-    name = args.name or (Path(path).name if path else None)
-    if not name:
-        sys.exit("mmi: give a project name, or run this inside a git repo")
-    if not (path or git_url):
-        sys.exit("mmi: not in a git repo; pass --path (a folder on the hub) or --git <clone url>")
-    p = admin(cfg, "add_project", name=name, path=path, git_url=git_url, description=args.description or "",
-              organizers=args.organizers, trust=args.trust)
-    how = f"cloned from {p['source']}" if p["action"] == "cloned" else "existing folder"
-    print(f"project {p['name']} -> {p['path']} on the hub ({how}); starting {p['organizers']} organizer(s)")
-    if args.trust:
-        print("the hub will accept Claude Code's folder-trust prompt for this folder (you passed --trust)")
-    else:
-        print(f"first time only: Claude Code asks whether to trust {p['path']}. "
-              f"`mmi attach org-{p['name']}-1` on the hub and answer it (or re-add with --trust)")
+    """Create a project and/or add folders to it. Folders are on this machine (default: the current folder);
+    git isn't involved, except that --git also clones a copy onto the hub for the organizer to read."""
+    folders = [str(Path(f).expanduser().resolve()) for f in args.folders]
+    if not folders and not args.git and not args.no_folder:
+        folders = [os.getcwd()]
+    missing = [f for f in folders if not Path(f).is_dir()]
+    if missing:
+        sys.exit(f"mmi: not a folder on this machine: {', '.join(missing)}")
+    p = admin(cfg, "add_project", name=args.name, folders=folders, machine=cfg["machine"], git_url=args.git,
+              description=args.description, organizers=args.organizers, trust=True if args.trust else None)
+    print(f"project {p['name']}:")
+    print(_fmt_folders(p["folders"], p["hub_machine"]))
+    if p.get("cloned"):
+        print(f"  (cloned {args.git} into {p['cloned']} on the hub)")
+    if not p["hub_folders"]:
+        print(f"  note: no folders on the hub ({p['hub_machine']}), so the organizer can coordinate but can't read "
+              "code. Add one there, or pass --git <url> to clone a copy onto the hub.")
+    elif args.trust:
+        print("  the hub will accept Claude Code's folder-trust prompt for it (you passed --trust)")
+    if not args.trust and p["hub_folders"]:
+        print(f"  first time only: Claude Code may ask whether to trust {p['hub_folders'][0]}. "
+              f"`mmi attach org-{p['name']}-1` on the hub and answer it (or re-run with --trust)")
+    print("  sessions in these folders connect to it with /memyselfandi")
+
+
+def cmd_project_remove_folder(args, cfg):
+    folders = [str(Path(f).expanduser().resolve()) for f in args.folders] or [os.getcwd()]
+    p = admin(cfg, "remove_folders", name=args.name, folders=folders, machine=cfg["machine"])
+    for f in folders:
+        print(f"{'removed' if f in p['removed'] else 'not in the project'}: {cfg['machine']}: {f}")
+    print(f"project {p['name']} now:")
+    print(_fmt_folders(p["folders"], p["hub_machine"]))
+
+
+def cmd_project_show(args, cfg):
+    p = next((p for p in call(cfg, "list_projects") if p["name"] == args.name), None)
+    if not p:
+        sys.exit(f"mmi: no project {args.name!r}")
+    print(f"{p['name']}  ({p['organizers']} organizer(s), {p['queued']} queued"
+          f"{', auto-trust' if p.get('auto_trust') else ''})")
+    if p.get("description"):
+        print(f"  {p['description']}")
+    print(_fmt_folders(p["folders"], p["hub_machine"], indent="  "))
 
 
 def cmd_project_delete(args, cfg):
@@ -319,7 +344,32 @@ def cmd_revoke(args, cfg):
 
 def cmd_projects(args, cfg):
     for p in call(cfg, "list_projects"):
-        print(f"  {p['name']:<20} {p['queued']} queued   {p['path']}")
+        print(f"{p['name']}  ({p['queued']} queued)")
+        print(_fmt_folders(p["folders"], p["hub_machine"]))
+
+
+def cmd_ls(args, cfg):
+    """Organizers per project: who's running, what they're doing, queue, council."""
+    rows = admin(cfg, "organizers")
+    if not rows:
+        print("  (no projects; `mmi project add` in a repo)")
+        return
+    for r in rows:
+        live = [o for o in r["organizers"] if o["online"]]
+        print(f"{r['project']}  ({len(live)}/{r['wanted']} organizers up, {r['queued']} queued"
+              f"{', ' + str(len(r['council'])) + ' council' if r['council'] else ''})")
+        if not r["organizers"]:
+            print("    ○ not started yet")
+        for o in r["organizers"]:
+            dot = "●" if o["online"] else "○"
+            doing = f"handling {o['handling']}" if o["handling"] else (o.get("status") or "")
+            if not o["online"]:
+                doing = "offline"
+            print(f"    {dot} {o['id']:<24} {doing:<40} seen {ago(o['last_seen_ago_s'])} ago")
+        for c in r["council"]:
+            print(f"    ◆ {c['id']:<24} council {c['tier']} ({c['status']}): {c['role']}")
+        if args.folders:
+            print(_fmt_folders(r["folders"], r["hub_machine"], indent="      "))
 
 
 def fmt_tickets(tickets: list[dict]) -> str:
@@ -436,20 +486,32 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("project", help="register a project (gives it an organizer)")
     psub = s.add_subparsers(dest="pcmd", required=True)
-    pa = psub.add_parser("add", help="register a project and start its organizer (defaults from the repo you're in)")
-    pa.add_argument("name", nargs="?", help="default: the repo's folder name")
-    pa.add_argument("--path", help="folder on the hub machine (default: this repo, if it's on the hub)")
-    pa.add_argument("--git", help="clone URL; the hub clones it if the folder isn't on the hub (default: origin)")
+    pa = psub.add_parser("add", help="create a project and/or add folders on this machine to it")
+    pa.add_argument("name")
+    pa.add_argument("folders", nargs="*", help="folders on this machine (default: the current folder)")
+    pa.add_argument("--git", help="also clone this URL onto the hub as one of the project's folders")
+    pa.add_argument("--no-folder", action="store_true", help="just create the project, no folder")
     pa.add_argument("--trust", action="store_true",
-                    help="you trust this repo: let the hub accept Claude Code's folder-trust prompt for it")
+                    help="you trust its hub folders: let the hub accept Claude Code's folder-trust prompt")
     pa.add_argument("-d", "--description")
-    pa.add_argument("--organizers", type=int, default=1)
+    pa.add_argument("--organizers", type=int)
     pa.set_defaults(fn=cmd_project_add)
+    pr = psub.add_parser("remove-folder", help="take folders on this machine out of a project")
+    pr.add_argument("name")
+    pr.add_argument("folders", nargs="*", help="default: the current folder")
+    pr.set_defaults(fn=cmd_project_remove_folder)
+    ps = psub.add_parser("show", help="a project's folders on every machine")
+    ps.add_argument("name")
+    ps.set_defaults(fn=cmd_project_show)
     psub.add_parser("list").set_defaults(fn=cmd_projects)
     pd = psub.add_parser("delete", help="permanently delete a project and every row tagged with it")
     pd.add_argument("name")
     pd.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     pd.set_defaults(fn=cmd_project_delete)
+
+    s = sub.add_parser("ls", help="organizers per project: running?, doing what, queue")
+    s.add_argument("-f", "--folders", action="store_true", help="also list each project's folders")
+    s.set_defaults(fn=cmd_ls)
 
     s = sub.add_parser("invite", help="give someone a token that expires (use with --profile collab)")
     s.add_argument("name", help="who it's for (also their machine name)")
