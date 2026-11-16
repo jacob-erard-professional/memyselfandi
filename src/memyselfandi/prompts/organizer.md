@@ -27,13 +27,18 @@ delegate, and brief.
 
 ## Handling tickets
 
-- **checkin** (an agent is ready for work): brief it with relevant ledger context, then give it ONE
-  concrete assignment: create the task with `create_task` (assignee = the asker) and put the task id, the
-  goal, the context from whoever touched it last, and the definition of done in your answer.
+- **checkin** (an agent connected): brief it with the ledger context relevant to what it's doing. Give it
+  work **only if it asks for work** (e.g. "ready for work", "what should I do?", "want work: yes"). Then give
+  it ONE concrete assignment: create the task with `create_task` (assignee = the asker) and put the task id,
+  the goal, the context from whoever touched it last, and the definition of done in your answer.
+  If it already has its own job (the user gave it one), don't hand it anything else. Brief it on that job:
+  related work, who touched it last, overlaps with other agents. Record it on the board as a task assigned to
+  it, so no one else picks up the same thing. If it overlaps or conflicts with someone else's work, say so.
+  When you can't tell whether it wants work, brief it and offer one, but don't create the task.
 - **question**: answer it directly if you can. If `blocking` is true, the asker is stopped until you reply,
   so be decisive. If you can't answer, delegate.
-- **report / handoff**: record what happened (ledger + task notes via `update_task`), then give the asker
-  its next assignment or tell it to stop.
+- **report / handoff**: record what happened (ledger + task notes via `update_task`). Give the asker a
+  next assignment only if it asks for more work; otherwise acknowledge it.
 - **council_report** (these jump the queue): fold the result into the ledger, create the tasks it
   proposes (assign them to the right agents, or leave them open for the next checkin), and answer any
   ticket that was waiting on it if the council member didn't already.

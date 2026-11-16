@@ -20,7 +20,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from .projects import provision_project, remove_folders
+from .projects import NAME_RE, backfill_sources, provision_project, remove_folders
 from .store import DEFAULT_INVITE_LIMITS, Conflict, Forbidden, NotFound, Store
 
 DATA_DIR = Path(os.environ.get("MMI_DATA", Path.home() / ".local/share/memyselfandi"))
@@ -39,9 +39,10 @@ another agent (maybe on another computer) left off.
 Worker protocol:
 1. `register` once (name, machine, kind, project). Keep the returned id and pass it as agent_id everywhere.
    If you were given an agent id before, reuse it. `list_projects` shows project names.
-2. Check in: `ask_organizer(kind="checkin", body="who you are, what you see in the repo, what you're
-   ready for")`, then `wait_for_reply(ticket_id)`. The reply is your briefing and assignment.
-3. Work the assignment. Use `heartbeat` with a one-line status when your focus changes, and `update_task`
+2. Check in: `ask_organizer(kind="checkin", body="who you are, what you're working on (or that you want
+   work), what you see in the repo")`, then `wait_for_reply(ticket_id)`. The reply is your briefing. The
+   organizer assigns you work only if you ask for it.
+3. Do your work. Use `heartbeat` with a one-line status when your focus changes, and `update_task`
    for progress notes.
 4. Questions: `ask_organizer(kind="question", blocking=...)`.
    - If the answer is the ONLY thing that unblocks you, set blocking=true and `wait_for_reply`
@@ -89,6 +90,93 @@ class RateLimiter:
             q.append(now)
 
 
+JOIN_TTL_S = 600
+JOIN_MAX_PENDING = 5
+
+
+class Joins:
+    """Machines asking to join (`mmi join`), waiting for you to `mmi approve <code>` on a trusted machine.
+    In memory only: a code lives 10 minutes, at most 5 wait at once, and the token goes only to whoever holds the
+    request's secret poll id."""
+
+    def __init__(self, store: Store, enabled: bool = True):
+        self.store, self.lock, self.pending, self.enabled = store, threading.Lock(), {}, enabled
+        self.last_notify = 0.0
+
+    def _sweep(self) -> None:
+        now = time.time()
+        for code in [c for c, j in self.pending.items() if now - j["created"] > JOIN_TTL_S]:
+            del self.pending[code]
+
+    def start(self, machine: str) -> dict[str, Any]:
+        import secrets
+
+        if not self.enabled:
+            raise NotFound("this hub doesn't take join requests (hub config allow_join: false)")
+        if not NAME_RE.match(machine or ""):
+            raise ValueError("machine name must be letters, digits, '.', '_' or '-'")
+        with self.lock:
+            self._sweep()
+            if len(self.pending) >= JOIN_MAX_PENDING:
+                raise Conflict("too many machines waiting to join; try again in a few minutes")
+            alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+            code = "-".join("".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(2))
+            poll = secrets.token_urlsafe(32)
+            self.pending[code] = {"machine": machine, "poll": poll, "created": time.time(), "token": None}
+        if time.time() - self.last_notify > 60:  # one alert a minute at most, whoever is asking
+            self.last_notify = time.time()
+            _notify(f"memyselfandi: '{machine}' wants to join your hub. If that's you, run `mmi approve {code}`.")
+        return {"code": code, "poll": poll, "expires_in": JOIN_TTL_S}
+
+    def poll(self, poll: str) -> dict[str, Any]:
+        with self.lock:
+            self._sweep()
+            for code, j in list(self.pending.items()):
+                if hmac.compare_digest(j["poll"], poll or ""):
+                    if j["token"]:
+                        del self.pending[code]
+                        return {"status": "approved", "token": j["token"], "machine": j["machine"]}
+                    return {"status": "pending"}
+        raise NotFound("no such join request (it expired, or was denied)")
+
+    def list(self) -> list[dict[str, Any]]:
+        with self.lock:
+            self._sweep()
+            return [{"code": c, "machine": j["machine"], "age_s": int(time.time() - j["created"]),
+                     "approved": bool(j["token"])} for c, j in self.pending.items()]
+
+    def approve(self, code: str) -> dict[str, Any]:
+        with self.lock:
+            self._sweep()
+            j = self.pending.get((code or "").strip().upper())
+            if not j or j["token"]:
+                raise NotFound(f"no machine waiting with code {code!r} (codes expire after 10 minutes)")
+            j["token"] = self.store.create_machine_token(j["machine"])
+            return {"machine": j["machine"]}
+
+    def deny(self, code: str) -> dict[str, Any]:
+        with self.lock:
+            j = self.pending.pop((code or "").strip().upper(), None)
+        if not j:
+            raise NotFound(f"no machine waiting with code {code!r}")
+        return {"machine": j["machine"], "denied": True}
+
+
+def _notify(message: str) -> None:
+    """Best effort: run the configured notify command (hub config "notify_cmd" / MMI_NOTIFY_CMD) with the message."""
+    import logging
+    import shlex
+    import subprocess
+
+    logging.getLogger("memyselfandi.hub").warning(message)
+    cmd = os.environ.get("MMI_NOTIFY_CMD")
+    if cmd:
+        try:
+            subprocess.Popen([*shlex.split(cmd), message], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
 def invitee_of(scope: dict | None) -> str | None:
     """The invite behind a request. Fails closed: an HTTP request that didn't pass through TokenAuth is refused."""
     if scope is None:  # in-process (tests); not reachable over the network
@@ -99,11 +187,12 @@ def invitee_of(scope: dict | None) -> str | None:
 
 
 def build_server(store: Store, projects_root: str | Path = Path.home() / "projects",
-                 invite_limits: dict[str, int] | None = None) -> MCPServer:
+                 invite_limits: dict[str, int] | None = None, allow_join: bool = True) -> MCPServer:
     mcp = MCPServer("memyselfandi", instructions=INSTRUCTIONS, version="0.2.0")
     tools: dict[str, Any] = {}
     limits = {**DEFAULT_INVITE_LIMITS, **(invite_limits or {})}
     limiter = RateLimiter(limits["calls_per_minute"])
+    joins = Joins(store, enabled=allow_join)
 
     def guard(name: str, params, invitee: str | None, kw: dict) -> None:
         """What an invite token may do. The hub token (invitee None) may do everything."""
@@ -478,6 +567,11 @@ def build_server(store: Store, projects_root: str | Path = Path.home() / "projec
             "create_invite": lambda: store.create_invite(**args),
             "list_invites": lambda: store.list_invites(),
             "organizers": lambda: store.organizers(),
+            "list_joins": lambda: joins.list(),
+            "approve_join": lambda: joins.approve(**args),
+            "deny_join": lambda: joins.deny(**args),
+            "list_machines": lambda: store.list_machines(),
+            "revoke_machine": lambda: store.revoke_machine(**args),
             "remove_folders": lambda: remove_folders(store, **args),
             "revoke_invite": lambda: store.revoke_invite(**args),
         }
@@ -487,8 +581,25 @@ def build_server(store: Store, projects_root: str | Path = Path.home() / "projec
             # off the event loop: add_project may git-clone, which can take a while
             result = await asyncio.to_thread(ops[request.path_params["op"]])
             return Response(json.dumps(result, default=str), media_type="application/json")
-        except (NotFound, TypeError, ValueError) as e:
+        except (NotFound, Conflict, TypeError, ValueError) as e:
             return JSONResponse({"error": str(e)}, status_code=400)
+
+    # Public (no token): a new machine asks to join, then polls until you approve it on a trusted machine.
+    @mcp.custom_route("/api/join/{op}", methods=["POST"])
+    async def join(request: Request) -> Response:
+        try:
+            args = await request.json() if await request.body() else {}
+            if request.path_params["op"] == "start":
+                return JSONResponse(joins.start(str(args.get("machine", ""))))
+            if request.path_params["op"] == "poll":
+                return JSONResponse(joins.poll(str(args.get("poll", ""))))
+        except NotFound as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        except Conflict as e:
+            return JSONResponse({"error": str(e)}, status_code=429)
+        except (TypeError, ValueError) as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return JSONResponse({"error": "no such op"}, status_code=404)
 
     return mcp
 
@@ -502,8 +613,9 @@ def _scope(ctx: Context) -> dict | None:
 
 
 class TokenAuth:
-    """Bearer auth. The hub token (yours) can do everything; a live invite token (`mmi invite`) can use the
-    agent tools but not /api/admin. /health stays public. With no hub token configured, auth is off."""
+    """Bearer auth. The hub token and machine tokens (`mmi join`, yours) can do everything; a live invite token
+    (`mmi invite`) gets only the invitee tools. /health and /api/join/* stay public (joining needs your approval).
+    With no hub token configured, auth is off."""
 
     def __init__(self, app, token: str | None, store: Store):
         self.app, self.token, self.store = app, token.encode() if token else None, store
@@ -511,10 +623,12 @@ class TokenAuth:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             invitee = None
-            if self.token and scope["path"] != "/health":
+            public = scope["path"] == "/health" or scope["path"].startswith("/api/join/")
+            if self.token and not public:
                 got = dict(scope.get("headers") or []).get(b"authorization", b"")
-                if not hmac.compare_digest(got, b"Bearer " + self.token):
-                    bearer = got[7:].decode(errors="replace") if got.startswith(b"Bearer ") else ""
+                bearer = got[7:].decode(errors="replace") if got.startswith(b"Bearer ") else ""
+                if not hmac.compare_digest(got, b"Bearer " + self.token) and not (
+                        bearer.startswith("mmd_") and self.store.check_machine(bearer)):  # your machines: full access
                     found = self.store.check_invite(bearer) if bearer.startswith("mmi_") else None
                     if found is None:
                         await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
@@ -529,8 +643,8 @@ class TokenAuth:
 
 
 def build_app(store: Store, host: str, token: str | None, projects_root: str | Path = Path.home() / "projects",
-              invite_limits: dict[str, int] | None = None):
-    mcp = build_server(store, projects_root, invite_limits)
+              invite_limits: dict[str, int] | None = None, allow_join: bool = True):
+    mcp = build_server(store, projects_root, invite_limits, allow_join)
     local = host in ("127.0.0.1", "localhost", "::1")
     security = None if local else TransportSecuritySettings(enable_dns_rebinding_protection=False)
     app = mcp.streamable_http_app(host=host, transport_security=security)
@@ -560,7 +674,7 @@ def start_retention(store: Store, retention_days: float) -> None:
 def serve(host: str, port: int, db: Path, token: str | None, supervise: bool = True,
           tiers: dict[str, str] | None = None, retention_days: float | None = None,
           unix_socket: str | None = None, projects_root: str | None = None, machine: str = "hub",
-          invite_limits: dict[str, int] | None = None) -> None:
+          invite_limits: dict[str, int] | None = None, allow_join: bool = True) -> None:
     import logging
     import shutil
 
@@ -570,6 +684,7 @@ def serve(host: str, port: int, db: Path, token: str | None, supervise: bool = T
     from .store import DEFAULT_RETENTION_DAYS
 
     store = Store(db, tiers=tiers, hub_machine=machine)
+    backfill_sources(store, projects_root or Path.home() / "projects")
     start_retention(store, retention_days or DEFAULT_RETENTION_DAYS)
     if host not in ("127.0.0.1", "localhost", "::1") and not token:
         print("warning: listening beyond localhost without a token; anyone on that network can use the hub")
@@ -597,6 +712,6 @@ def serve(host: str, port: int, db: Path, token: str | None, supervise: bool = T
         path.chmod(0o660)
         sockets.append(uds)
         print(f"also listening on unix socket {path}")
-    app = build_app(store, host, token, projects_root or Path.home() / "projects", invite_limits)
+    app = build_app(store, host, token, projects_root or Path.home() / "projects", invite_limits, allow_join)
     uvicorn.Server(uvicorn.Config(app, log_level="warning",
                                   timeout_graceful_shutdown=3)).run(sockets=sockets)

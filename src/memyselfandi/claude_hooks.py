@@ -29,16 +29,20 @@ SKILL_DIR = None  # resolved at call time via skill_dir(); kept for tests that p
 HOOK_MARKER = "memyselfandi.cli hook session-start"  # earlier versions installed an auto-check-in hook
 
 
-def resolve_project(cwd: str, projects: list[dict[str, Any]], machine: str) -> str | None:
-    """Which project is this directory in? The one with a folder on this machine that contains it (the deepest,
-    if folders nest). Purely by path: git and folder names play no part."""
+def resolve_project(cwd: str, projects: list[dict[str, Any]], machine: str,
+                    projects_home: str | None = None) -> str | None:
+    """Which project is this directory in? The one with a folder containing it: a folder recorded for this
+    machine, or the project's usual folder name (`home_dir`) under this machine's projects home. The deepest
+    wins if folders nest. Purely by recorded paths: git and project names play no part."""
     here = Path(cwd).resolve()
     best: tuple[int, str] | None = None
+    home = Path(projects_home).expanduser() if projects_home else None
     for p in projects:
-        for f in p.get("folders", []):
-            if f["machine"] != machine:
-                continue
-            base = Path(f["path"])
+        bases = [Path(f["path"]) for f in p.get("folders", []) if f["machine"] == machine]
+        if home and p.get("home_dir"):
+            bases.append(home / p["home_dir"])
+        for base in bases:
+            base = base.resolve()
             if here == base or base in here.parents:
                 depth = len(base.parts)
                 if best is None or depth > best[0]:
@@ -51,9 +55,10 @@ def protocol(agent_id: str, project: str, machine: str) -> str:
 Connected to memyselfandi as worker `{agent_id}` on `{machine}`, project `{project}`.
 Pass agent_id="{agent_id}" and project="{project}" to the `{server_name()}` MCP tools.
 
-1. Check in: ask_organizer(kind="checkin", blocking=true, body=<what the user wants from this session, or
-   "ready for work", plus anything notable>), then wait_for_reply until status is answered (call it again
-   while it's queued / with_organizer / delegated). The reply is your briefing and assignment.
+1. Check in: ask_organizer(kind="checkin", blocking=true, body=<what the user wants from this session, plus
+   anything notable>), then wait_for_reply until status is answered (call it again while it's queued /
+   with_organizer / delegated). The reply is your briefing. Say "ready for work" ONLY if the user didn't give
+   you a job and wants the organizer to pick one; the organizer assigns work only when asked.
 2. The user's instructions in this session take precedence over the organizer's. If they asked for
    something specific, say so in the check-in and do what they asked.
 3. Questions: blocking=true only if the answer is the ONLY thing unblocking you; otherwise blocking=false,
@@ -74,7 +79,7 @@ def connect(cfg: dict[str, Any], call, cwd: str, project: str | None = None) -> 
     names = sorted(p["name"] for p in projects)
     if project and project not in names:
         raise LookupError(f"no project {project!r}; projects: {', '.join(names) or '(none)'}")
-    project = project or resolve_project(cwd, projects, cfg["machine"])
+    project = project or resolve_project(cwd, projects, cfg["machine"], cfg.get("projects_home", "~/projects"))
     if not project:
         raise LookupError(f"{cwd} isn't in any project's folders on {cfg['machine']}. "
                           f"Projects: {', '.join(names) or '(none)'}. The user can run `mmi project add <name>` "

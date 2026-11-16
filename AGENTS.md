@@ -30,6 +30,11 @@
 - deploy/collab: the sidecar must keep its own network namespace (bridge). Tailscale userspace mode forwards
   unserved ports to the namespace's localhost; with `network_mode: host` that exposed the PC's localhost services.
   The hub is reached via the unix socket (`config --socket`) + socat relay.
+- Machines join with `mmi join` (public `/api/join/start|poll`, in-memory codes, approved via `/api/admin/approve_join`)
+  and get their own `mmd_` token (`machines` table): full access like the hub token, revocable. Hub config
+  `allow_join: false` turns joining off (the collab hub, which invitees can reach).
+- Projects record `home_dir` (folder name relative to a machine's projects home) and `git_url`, so `join` can link
+  or clone and `resolve_project` matches `<projects home>/<home_dir>` with no per-machine step.
 - A project is a name plus folders on any machines (`project_folders`: project, machine, path). It is not tied to
   git. A session belongs to the project with a folder on its machine containing its cwd (`resolve_project`).
   Organizer/council get `Read` on the project's *hub* folders only, and are restarted (when idle) if those change.

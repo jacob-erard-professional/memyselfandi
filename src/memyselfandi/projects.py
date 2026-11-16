@@ -44,7 +44,7 @@ def _clone(git_url: str, target: Path) -> None:
 def provision_project(
     store: Store, name: str, projects_root: str | Path, folders: list[str] | None = None,
     machine: str | None = None, git_url: str | None = None, description: str | None = None,
-    organizers: int | None = None, trust: bool | None = None,
+    organizers: int | None = None, trust: bool | None = None, home_dir: str | None = None,
 ) -> dict[str, Any]:
     """Create project `name` (if new) and attach folders to it. A project is a set of folders on any of your
     machines; git plays no part in it. Folders on the hub must exist here (the organizer reads them); folders on
@@ -75,6 +75,9 @@ def provision_project(
     project = store.add_project(name, description=description, organizers=organizers, auto_trust=trust)
     for m, f in attach:
         store.add_folder(name, f, m)
+    if home_dir and _safe_rel(home_dir):
+        store.set_project_sources(name, home_dir=home_dir)
+    remember_sources(store, name, projects_root, git_url)
     return {**store.get_project(name), "attached": [{"machine": m, "path": f} for m, f in attach],
             "cloned": cloned}
 
@@ -83,3 +86,34 @@ def remove_folders(store: Store, name: str, folders: list[str], machine: str | N
     machine = machine or store.hub_machine
     removed = [f for f in folders if store.remove_folder(name, f, machine)]
     return {**store.get_project(name), "removed": removed}
+
+
+def _safe_rel(rel: str) -> bool:
+    """A projects-home-relative folder name: no absolute paths, no '..'."""
+    p = Path(rel)
+    return bool(rel) and not p.is_absolute() and ".." not in p.parts
+
+
+def remember_sources(store: Store, name: str, projects_root: str | Path, git_url: str | None = None) -> None:
+    """Fill in (if unset) the project's usual folder name, relative to a projects home, and a clone URL, from its
+    hub folders. Used by `mmi join` on other machines: link `<their projects home>/<home_dir>`, or clone it."""
+    root = Path(projects_root).expanduser().resolve()
+    p = store.get_project(name)
+    home_dir = None
+    for f in p["hub_folders"]:
+        try:
+            home_dir = str(Path(f).relative_to(root))
+            break
+        except ValueError:
+            continue
+    url = git_url or next((u for u in (_origin(Path(f)) for f in p["hub_folders"] if Path(f).is_dir()) if u), None)
+    store.set_project_sources(name, home_dir=home_dir, git_url=url)
+
+
+def backfill_sources(store: Store, projects_root: str | Path) -> None:
+    for p in store.list_projects():
+        if not p.get("home_dir") or not p.get("git_url"):
+            try:
+                remember_sources(store, p["name"], projects_root)
+            except Exception:
+                pass

@@ -1,6 +1,6 @@
 ---
 name: {server}
-description: Connect this session to the memyselfandi organizer for the current project, to check in for a briefing and assignment, ask the organizer a question, or hand off work to the next agent. Use only when the user asks (e.g. "check in with the organizer", "connect to memyselfandi", "hand this off", /memyselfandi).
+description: Connect this session to the memyselfandi organizer for the current project, to check in for a briefing (and work, if wanted), ask the organizer a question, or hand off work to the next agent. Use only when the user asks (e.g. "check in with the organizer", "connect to memyselfandi", "hand this off", /memyselfandi).
 ---
 
 # memyselfandi
@@ -30,7 +30,9 @@ across machines and remembers where work left off.
    If it fails with a permission error, this machine has an invite token that can't change projects; tell the
    user.
 3. Follow the printed protocol with the `{server}` MCP tools. Usually: check in, wait for the
-   organizer's reply, and relay the briefing to the user.
+   organizer's reply, and relay the briefing to the user. In the check-in, say what the user wants from
+   this session. Ask the organizer for work only if the user wants it to pick something (e.g. they just said
+   "/memyselfandi" or "what should I work on?"); the organizer won't hand out work unless asked.
 
 If the user invoked this to hand off or report, connect if needed, then ask_organizer(kind="handoff") with
 what's done, what's left, and where.

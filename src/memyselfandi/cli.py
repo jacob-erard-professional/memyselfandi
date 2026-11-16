@@ -141,9 +141,12 @@ def cmd_serve(args, cfg):
     from .hub import DEFAULT_DB, serve
 
     token = os.environ.get("MMI_TOKEN") or cfg.get("hub_token")
+    if cfg.get("notify_cmd") and not os.environ.get("MMI_NOTIFY_CMD"):
+        os.environ["MMI_NOTIFY_CMD"] = cfg["notify_cmd"]  # supervisor + hub alerts (trust prompts, elders, joins)
     serve(args.host, args.port or cfg.get("port") or DEFAULT_PORT, Path(args.db or DEFAULT_DB), token, supervise=not args.no_supervise,
           tiers=cfg.get("tiers"), retention_days=cfg.get("retention_days"), unix_socket=cfg.get("socket"),
-          machine=cfg["machine"], invite_limits=cfg.get("invite_limits"))
+          machine=cfg["machine"], invite_limits=cfg.get("invite_limits"), projects_root=cfg.get("projects_home"),
+          allow_join=cfg.get("allow_join", True))
 
 
 def cmd_up(args, cfg):
@@ -268,7 +271,8 @@ def cmd_project_add(args, cfg):
     if missing:
         sys.exit(f"mmi: not a folder on this machine: {', '.join(missing)}")
     p = admin(cfg, "add_project", name=args.name, folders=folders, machine=cfg["machine"], git_url=args.git,
-              description=args.description, organizers=args.organizers, trust=True if args.trust else None)
+              description=args.description, organizers=args.organizers, trust=True if args.trust else None,
+              home_dir=next((r for r in (_home_rel(cfg, f) for f in folders) if r), None))
     print(f"project {p['name']}:")
     print(_fmt_folders(p["folders"], p["hub_machine"]))
     if p.get("cloned"):
@@ -284,11 +288,168 @@ def cmd_project_add(args, cfg):
     print("  sessions in these folders connect to it with /memyselfandi")
 
 
+def _projects_home(cfg) -> Path:
+    return Path(cfg.get("projects_home") or "~/projects").expanduser().resolve()
+
+
+def _home_rel(cfg, folder: str) -> str | None:
+    """`folder` relative to this machine's projects home, or None if it's elsewhere."""
+    try:
+        rel = Path(folder).resolve().relative_to(_projects_home(cfg))
+    except ValueError:
+        return None
+    return str(rel) if rel.parts else None
+
+
+def _post(url: str, path: str, body: dict) -> tuple[int, dict]:
+    req = urllib.request.Request(url.rstrip("/") + path, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read())
+        except Exception:
+            return e.code, {"error": str(e)}
+    except OSError as e:
+        sys.exit(f"mmi: can't reach {url} ({e}). Is the hub running, and is this machine on the tailnet?")
+
+
+def _clone_into(url: str, target: Path) -> bool:
+    import shutil
+    import subprocess
+
+    cmd = ["git"]
+    if url.startswith("https://") and shutil.which("gh"):
+        cmd += ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run([*cmd, "clone", "--quiet", url, str(target)], env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    return r.returncode == 0
+
+
+def cmd_join(args, cfg):
+    """Set this machine up in one go: get a token by approval, link the projects already in your projects home
+    (offer to clone the others), and install the Claude Code integration."""
+    url = args.url.rstrip("/")
+    machine = args.machine or cfg["machine"]
+    stored = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+    if args.projects_home:
+        stored["projects_home"] = str(Path(args.projects_home).expanduser())
+
+    token = stored.get("token") if stored.get("url", "").rstrip("/") == url else None
+    if token:
+        code, _ = _post_auth(url, token)
+        if code != 200:
+            token = None
+    if token:
+        print(f"already joined {url} as {stored.get('machine', machine)}")
+        machine = stored.get("machine", machine)
+    else:
+        code, r = _post(url, "/api/join/start", {"machine": machine})
+        if code != 200:
+            sys.exit(f"mmi: {r.get('error', r)}")
+        print(f"Asking {url} to let '{machine}' join.\n")
+        print(f"    code: {r['code']}\n")
+        print(f"On a machine that's already joined (e.g. the hub PC), run:  mmi approve {r['code']}")
+        print("Waiting (up to 10 minutes; Ctrl-C to give up)...", flush=True)
+        deadline = time.time() + r["expires_in"]
+        while time.time() < deadline:
+            time.sleep(2)
+            code, got = _post(url, "/api/join/poll", {"poll": r["poll"]})
+            if code == 200 and got.get("status") == "approved":
+                token = got["token"]
+                break
+            if code != 200:
+                sys.exit(f"mmi: {got.get('error', got)}")
+        if not token:
+            sys.exit("mmi: the code expired; run `mmi join` again")
+        print(f"approved: this machine is '{machine}'")
+    stored.update({"url": url, "token": token, "machine": machine})
+    save_config(stored)
+    cfg = load_config()
+
+    home = _projects_home(cfg)
+    print(f"\nprojects (projects home: {home})")
+    for p in call(cfg, "list_projects"):
+        here = [f["path"] for f in p["folders"] if f["machine"] == machine]
+        if here:
+            print(f"  {p['name']:<20} linked: {', '.join(here)}")
+            continue
+        target = home / p["home_dir"] if p.get("home_dir") else None
+        if target and target.is_dir():
+            admin(cfg, "add_project", name=p["name"], folders=[str(target)], machine=machine)
+            print(f"  {p['name']:<20} linked: {target}")
+        elif target and p.get("git_url") and not args.no_clone and (
+                args.clone or (sys.stdin.isatty() and input(f"  {p['name']:<20} not here. Clone {p['git_url']} "
+                                                            f"into {target}? [y/N] ").strip().lower() == "y")):
+            if _clone_into(p["git_url"], target):
+                admin(cfg, "add_project", name=p["name"], folders=[str(target)], machine=machine)
+                print(f"  {p['name']:<20} cloned and linked: {target}")
+            else:
+                print(f"  {p['name']:<20} clone failed; skipped")
+        else:
+            where = f"no {target}" if target else "no usual folder recorded"
+            print(f"  {p['name']:<20} not linked ({where}). In its folder: mmi project add {p['name']}")
+    if not args.no_claude:
+        print()
+        args.uninstall = args.dry_run = False
+        cmd_install_claude(args, cfg)
+    print("\ndone. In any project folder, open Claude Code and type /memyselfandi")
+
+
+def _post_auth(url: str, token: str) -> tuple[int, Any]:
+    req = urllib.request.Request(url + "/api/tool/list_projects", data=b"{}", method="POST",
+                                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, None
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except OSError as e:
+        sys.exit(f"mmi: can't reach {url} ({e}). Is the hub running, and is this machine on the tailnet?")
+
+
+def cmd_approve(args, cfg):
+    if not args.code:
+        waiting = admin(cfg, "list_joins")
+        if not waiting:
+            print("  (no machines waiting to join)")
+        for j in waiting:
+            print(f"  {j['code']}  {j['machine']:<24} asked {ago(j['age_s'])} ago")
+        return
+    if args.deny:
+        admin(cfg, "deny_join", code=args.code)
+        print(f"denied {args.code}")
+        return
+    r = admin(cfg, "approve_join", code=args.code)
+    print(f"approved '{r['machine']}'. It has its own token now (`mmi machines --revoke {r['machine']}` to cut it off)")
+
+
+def cmd_machines(args, cfg):
+    if args.revoke:
+        admin(cfg, "revoke_machine", name=args.revoke)
+        print(f"revoked {args.revoke}: its token stops working now")
+        return
+    rows = admin(cfg, "list_machines")
+    if not rows:
+        print("  (no machines joined with `mmi join` yet)")
+    for m in rows:
+        state = f"revoked {time.strftime('%Y-%m-%d', time.localtime(m['revoked_at']))}" if m["revoked_at"] else "active"
+        print(f"  {m['name']:<24} joined {time.strftime('%Y-%m-%d', time.localtime(m['created_at']))}  {state}")
+
+
 def cmd_project_remove_folder(args, cfg):
-    folders = [str(Path(f).expanduser().resolve()) for f in args.folders] or [os.getcwd()]
-    p = admin(cfg, "remove_folders", name=args.name, folders=folders, machine=cfg["machine"])
+    machine = args.machine or cfg["machine"]
+    if args.machine and args.machine != cfg["machine"]:
+        if not args.folders:
+            sys.exit("mmi: give the folder paths as they appear in `mmi project show` for another machine")
+        folders = args.folders  # another machine's paths: don't resolve them here
+    else:
+        folders = [str(Path(f).expanduser().resolve()) for f in args.folders] or [os.getcwd()]
+    p = admin(cfg, "remove_folders", name=args.name, folders=folders, machine=machine)
     for f in folders:
-        print(f"{'removed' if f in p['removed'] else 'not in the project'}: {cfg['machine']}: {f}")
+        print(f"{'removed' if f in p['removed'] else 'not in the project'}: {machine}: {f}")
     print(f"project {p['name']} now:")
     print(_fmt_folders(p["folders"], p["hub_machine"]))
 
@@ -350,6 +511,8 @@ def cmd_projects(args, cfg):
 
 def cmd_ls(args, cfg):
     """Organizers per project: who's running, what they're doing, queue, council."""
+    for j in admin(cfg, "list_joins"):
+        print(f"! '{j['machine']}' wants to join: mmi approve {j['code']}")
     rows = admin(cfg, "organizers")
     if not rows:
         print("  (no projects; `mmi project add` in a repo)")
@@ -496,9 +659,10 @@ def main(argv: list[str] | None = None) -> None:
     pa.add_argument("-d", "--description")
     pa.add_argument("--organizers", type=int)
     pa.set_defaults(fn=cmd_project_add)
-    pr = psub.add_parser("remove-folder", help="take folders on this machine out of a project")
+    pr = psub.add_parser("remove-folder", help="take folders on this (or another) machine out of a project")
     pr.add_argument("name")
     pr.add_argument("folders", nargs="*", help="default: the current folder")
+    pr.add_argument("--machine", help="the machine the folders are on (default: this one)")
     pr.set_defaults(fn=cmd_project_remove_folder)
     ps = psub.add_parser("show", help="a project's folders on every machine")
     ps.add_argument("name")
@@ -508,6 +672,22 @@ def main(argv: list[str] | None = None) -> None:
     pd.add_argument("name")
     pd.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     pd.set_defaults(fn=cmd_project_delete)
+
+    s = sub.add_parser("join", help="set up this machine: approve-by-code, link projects, install Claude Code bits")
+    s.add_argument("url", help="the hub, e.g. http://jacob-erard-desktop:7377")
+    s.add_argument("--machine", help="this machine's name (default: hostname)")
+    s.add_argument("--projects-home", help="where your projects live on this machine (default ~/projects)")
+    s.add_argument("--clone", action="store_true", help="clone missing projects without asking")
+    s.add_argument("--no-clone", action="store_true", help="never clone")
+    s.add_argument("--no-claude", action="store_true", help="skip installing the Claude Code integration")
+    s.set_defaults(fn=cmd_join)
+    s = sub.add_parser("approve", help="let a machine that ran `mmi join` in (no code: list waiting machines)")
+    s.add_argument("code", nargs="?")
+    s.add_argument("--deny", action="store_true")
+    s.set_defaults(fn=cmd_approve)
+    s = sub.add_parser("machines", help="machines joined with `mmi join` (--revoke NAME to cut one off)")
+    s.add_argument("--revoke", metavar="NAME")
+    s.set_defaults(fn=cmd_machines)
 
     s = sub.add_parser("ls", help="organizers per project: running?, doing what, queue")
     s.add_argument("-f", "--folders", action="store_true", help="also list each project's folders")

@@ -175,6 +175,16 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "ALTER TABLE agents ADD COLUMN owner TEXT",      # invite name; NULL = registered with the hub token
         "CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner)",
     ]),
+    (8, "machines join with their own revocable tokens; projects remember their folder name and clone URL", [
+        """CREATE TABLE machines (
+            name         TEXT PRIMARY KEY,
+            token_sha256 TEXT NOT NULL UNIQUE,
+            created_at   REAL NOT NULL,
+            revoked_at   REAL
+        )""",
+        "ALTER TABLE projects ADD COLUMN home_dir TEXT",  # relative to each machine's projects home, e.g. WellWatch
+        "ALTER TABLE projects ADD COLUMN git_url TEXT",   # where `mmi join` can clone it from (optional)
+    ]),
 ]
 
 # What one invitee may do (hub config "invite_limits" overrides). Tickets are what spend the organizer's tokens.
@@ -890,6 +900,34 @@ class Store:
         self._invite(name)
         self._x("UPDATE invites SET revoked_at=? WHERE name=? AND revoked_at IS NULL", (time.time(), name))
         return self._invite(name)
+
+    # -- machines (your own devices; full access, like the hub token, but each revocable) ----
+    def create_machine_token(self, name: str) -> str:
+        token = "mmd_" + secrets.token_urlsafe(24)
+        self._x("""INSERT INTO machines (name, token_sha256, created_at) VALUES (?, ?, ?)
+                   ON CONFLICT(name) DO UPDATE SET token_sha256=excluded.token_sha256,
+                       created_at=excluded.created_at, revoked_at=NULL""", (name, self._hash(token), time.time()))
+        return token
+
+    def check_machine(self, token: str) -> str | None:
+        rows = self._q("SELECT name FROM machines WHERE token_sha256=? AND revoked_at IS NULL", (self._hash(token),))
+        return rows[0]["name"] if rows else None
+
+    def list_machines(self) -> list[dict[str, Any]]:
+        return self._q("SELECT name, created_at, revoked_at FROM machines ORDER BY created_at")
+
+    def revoke_machine(self, name: str) -> dict[str, Any]:
+        if not self._q("SELECT 1 FROM machines WHERE name=?", (name,)):
+            raise NotFound(f"no machine {name!r}")
+        self._x("UPDATE machines SET revoked_at=? WHERE name=? AND revoked_at IS NULL", (time.time(), name))
+        return self._q("SELECT name, created_at, revoked_at FROM machines WHERE name=?", (name,))[0]
+
+    def set_project_sources(self, name: str, home_dir: str | None = None, git_url: str | None = None) -> None:
+        """Remember (only if unset) where the project usually lives and where it can be cloned from."""
+        if home_dir:
+            self._x("UPDATE projects SET home_dir=? WHERE name=? AND home_dir IS NULL", (home_dir, name))
+        if git_url:
+            self._x("UPDATE projects SET git_url=? WHERE name=? AND git_url IS NULL", (git_url, name))
 
     def check_invite(self, token: str) -> str | None:
         """The invitee's name if `token` is a live invite token. Read-only (no disk write per request)."""

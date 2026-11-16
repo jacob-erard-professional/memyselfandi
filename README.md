@@ -2,7 +2,7 @@
 
 One organizer per project that every agent on every machine reports to. Workers (Claude Code, Codex,
 on your PC or laptop) queue up to talk to it, get briefed with exactly where the last agent left off,
-and get their next assignment. The organizer can summon a council of specialists to take work off its
+and get work when they ask for it. The organizer can summon a council of specialists to take work off its
 plate, and they hand work back out.
 
 ```
@@ -28,7 +28,7 @@ plate, and they hand work back out.
 - **Projects** are registered on the hub with a repo path (`mmi project add`). Each gets 1+ organizers.
 - **Workers** opt in with the `/memyselfandi` skill. Then they follow the protocol:
   1. `register`
-  2. `ask_organizer(kind="checkin")` and wait for the reply, which is the briefing plus an assignment
+  2. `ask_organizer(kind="checkin")` and wait for the reply, which is the briefing (plus an assignment, if the agent asked for work)
   3. Work.
      - **Questions:** `ask_organizer(kind="question", blocking=…)`.
      - **Blocking:** if the answer is the *only* thing that unblocks them, they `wait_for_reply`.
@@ -75,10 +75,17 @@ creates the `mmi` tmux session for the agents.
 ### Every other machine (laptop, ...)
 
 ```bash
-git clone <this repo> && cd memyselfandi && uv sync
-uv run mmi config --url http://jacob-erard-desktop:7377 --token <`mmi config --show-token` on the PC>
-uv run mmi install-claude                    # Claude Code (`mmi mcp-setup` prints the Codex config block)
+git clone https://github.com/jacob-erard-professional/memyselfandi ~/projects/memyselfandi
+uv tool install --editable ~/projects/memyselfandi
+mmi join http://jacob-erard-desktop:7377      # shows a code; on the PC: mmi approve <code>
 ```
+
+`mmi join` gets this machine its own token (no copying the hub token; `mmi machines --revoke <name>` cuts it
+off), links every project that's already in your projects home (`~/projects` by default, `--projects-home` to
+change it), offers to clone the missing ones, and installs the Claude Code integration. Then `/memyselfandi` in
+any session. Run it again any time to pick up new projects. `mmi ls` on the PC also shows machines waiting.
+Set `"notify_cmd"` in the hub's config (e.g. `"slack-notify"`) to get pinged for join requests, trust prompts and
+elder summons.
 
 ### Projects
 
